@@ -1,0 +1,4 @@
+#!/bin/bash
+# pi, with the SenseNova Loop servers detected first (loop-detect writes them into models.json)
+"$LOOP_AGENT_DIR/bin/loop-detect" --quiet || true
+exec "$LOOP_PI_BIN" "$@"

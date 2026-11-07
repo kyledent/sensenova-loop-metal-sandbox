@@ -1,0 +1,78 @@
+;; Seatbelt profile for pi and everything the agent runs. What a container would give it: a home of its own, the
+;; workspace, the system's tools, and nothing else of yours. Children inherit the sandbox.
+;;
+;; Reads are an allow list, not "everything but ~", so other volumes, /tmp and other users' files are out too.
+;; The mach list leaves out com.apple.SecurityServer and secd (the keychain), launchservicesd (the "open" command,
+;; which starts apps outside this sandbox) and the pasteboard.
+;;
+;; Parameters (given by ./loop, all canonical paths): AGENT_HOME, WORKSPACE, PI_DIR, AGENT_DIR, NODE_PREFIX
+;; ./loop appends the network rules (LOOP_AGENT_NETWORK) and a rule for the terminal in use.
+(version 1)
+(deny default)
+(import "system.sb")
+
+(allow process-exec process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+(allow ipc-posix-sem ipc-posix-shm)
+(allow user-preference-read)
+(allow file-map-executable)
+
+;; Read only: the system and its tools, Homebrew, pi itself, node
+(allow file-read-metadata)
+(allow file-read*
+    (literal "/")
+    (subpath "/System")
+    (subpath "/Library")
+    (subpath "/Applications/Xcode.app")
+    (subpath "/bin")
+    (subpath "/sbin")
+    (subpath "/usr")
+    (subpath "/opt")
+    (subpath "/private/etc")
+    (subpath "/private/var/db/dyld")
+    (subpath "/private/var/db/timezone")
+    (subpath "/private/var/select")
+    (literal "/private/var/run/resolv.conf")
+    (subpath (param "PI_DIR"))
+    (subpath (param "AGENT_DIR"))
+    (subpath (param "NODE_PREFIX")))
+
+;; Read and write: the agent's home (HOME and TMPDIR point there) and the workspace
+(allow file-read* file-write*
+    (subpath (param "AGENT_HOME"))
+    (subpath (param "WORKSPACE")))
+(allow network-bind network-inbound network-outbound
+    (subpath (param "AGENT_HOME"))
+    (subpath (param "WORKSPACE")))
+
+;; Devices and terminals: ptys the agent opens itself, not your other terminal windows
+(allow file-read* (subpath "/dev"))
+(allow file-write*
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/dtracehelper"))
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx") (literal "/dev/tty"))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))
+(allow file-read* file-write*
+    (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))
+
+(allow mach-lookup
+    (global-name "com.apple.cfprefsd.agent")
+    (global-name "com.apple.cfprefsd.daemon")
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.membership")
+    (global-name "com.apple.system.logger")
+    (global-name "com.apple.logd")
+    (global-name "com.apple.diagnosticd")
+    (global-name "com.apple.analyticsd")
+    (global-name "com.apple.SystemConfiguration.configd")
+    (global-name "com.apple.dnssd.service")
+    (global-name "com.apple.trustd")
+    (global-name "com.apple.trustd.agent")
+    (global-name "com.apple.FSEvents"))
+
+(allow system-socket)

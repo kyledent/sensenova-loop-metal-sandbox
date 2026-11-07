@@ -1,0 +1,130 @@
+#!/bin/bash
+# Find the SenseNova Loop servers that answer and write them into pi's models.json.
+#
+# Candidates: every port in LOOP_PORTS on loopback. A server counts when GET /health is ok and its model id contains
+# "sensenova-loop", so another llama-server on the same port is left alone. Each one becomes a provider "loop-<port>"
+# with its model id and context. The providers whose name starts with "loop" belong to this script and are replaced on
+# every run; the other providers in models.json are kept. pi reloads models.json when /model opens, so
+# running this during a session picks up a server that has started since.
+#
+#   loop-detect           list what it finds and update the files
+#   loop-detect --quiet   one summary line (the pi wrapper uses this)
+set -euo pipefail
+
+quiet=0
+case "${1:-}" in -q|--quiet) quiet=1 ;; esac
+
+agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+models="$agent_dir/models.json"
+settings="$agent_dir/settings.json"
+ports="${LOOP_PORTS:-8080-8083}"
+thinking="${LOOP_THINKING:-1}"
+# Thinking spends output tokens before the answer, so the cap is higher with it on: room for the xhigh level's 16K
+# thinking budget and an answer
+if [ "$thinking" = 1 ]; then max_output="${LOOP_MAX_OUTPUT:-24576}"; else max_output="${LOOP_MAX_OUTPUT:-8192}"; fi
+mkdir -p "$agent_dir/extensions"
+
+# The extension that shapes each request for this model. It belongs to this script and is replaced on every run.
+ext_src="$LOOP_AGENT_DIR/share/loop-thinking.ts"
+ext="$agent_dir/extensions/loop-thinking.ts"
+if [ -f "$ext_src" ]; then cmp -s "$ext_src" "$ext" || cp "$ext_src" "$ext"; fi
+
+say() { [ "$quiet" = 1 ] || echo "$@"; }
+
+# "8080-8083 8100" -> 8080 8081 8082 8083 8100
+expand_ports() {
+    local p
+    for p in ${1//,/ }; do
+        if [[ "$p" == *-* ]]; then seq "${p%-*}" "${p#*-}"; else echo "$p"; fi
+    done
+}
+
+# /health needs no key; /props and /v1/models do when the server has one
+fetch() {
+    if [ -n "${LOOP_API_KEY:-}" ]; then
+        curl -fsS --connect-timeout 1 -m 3 -H "Authorization: Bearer $LOOP_API_KEY" "$1" 2>/dev/null
+    else
+        curl -fsS --connect-timeout 1 -m 3 "$1" 2>/dev/null
+    fi
+}
+
+if [ -n "${LOOP_API_KEY:-}" ]; then api_key=LOOP_API_KEY; else api_key=none; fi   # an env var name, resolved by pi
+
+found='{}'
+searched=
+for port in $(expand_ports "$ports"); do
+    base="http://127.0.0.1:$port"
+    searched="$searched $base"
+    fetch "$base/health" >/dev/null || continue
+    props=$(fetch "$base/props") || continue
+    id=$(fetch "$base/v1/models" | jq -r '.data[0].id // empty') || continue
+    case "$(echo "$id" | tr 'A-Z' 'a-z')" in *sensenova-loop*) ;; *) say "skip   $base  model $id"; continue ;; esac
+    ctx=$(jq -r '.default_generation_settings.n_ctx // empty' <<<"$props")
+    [ -n "$ctx" ] || continue
+    name="loop-$port"
+    # Thinking: pi sends chat_template_kwargs.enable_thinking (qwen-chat-template), and the loop-thinking extension
+    # adds the level's budget, as the template has no efforts. pi offers xhigh only when the map names it, and minimal
+    # is hidden, as it would be the same as low.
+    found=$(jq --arg name "$name" --arg url "$base/v1" --arg key "$api_key" --arg id "$id" --argjson ctx "$ctx" \
+               --argjson props "$props" --argjson maxout "$max_output" --arg port "$port" \
+               --argjson think "$([ "$thinking" = 1 ] && echo true || echo false)" '
+        .[$name] = {
+            baseUrl: $url, api: "openai-completions", apiKey: $key,
+            compat: ({supportsDeveloperRole: false, supportsReasoningEffort: false}
+                     + if $think then {thinkingFormat: "qwen-chat-template"} else {} end),
+            models: [({
+                id: $id,
+                name: "\($id) (:\($port), \($ctx) ctx)",
+                reasoning: $think,
+                input: (if $props.modalities.vision == true then ["text", "image"] else ["text"] end),
+                contextWindow: $ctx,
+                maxTokens: ([$maxout, ($ctx / 4 | floor)] | min),
+                cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+            } + if $think then {thinkingLevelMap: {minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh"}} else {} end)]
+        }' <<<"$found")
+    say "found  $name  $base  model $id, ctx $ctx"
+done
+
+# models.json: drop the old loop* providers, add the ones found now
+[ -s "$models" ] || echo '{"providers": {}}' > "$models"
+# Next to the files it replaces, not mktemp's, which fails in the sandbox
+tmp="$agent_dir/.loop-detect.$$"
+jq --argjson found "$found" '
+    .providers = ((.providers // {}) | with_entries(select(.key | startswith("loop") | not))) + $found
+' "$models" > "$tmp" && mv "$tmp" "$models"
+
+# settings.json: the server has one slot and reads a long new prompt slowly, so give requests an hour and do not let
+# retries queue behind the request it is still reading.
+# Compaction: pi checks the context only when an agent run ends, so a run of tool calls must fit in the reserve: 24K (a
+# quarter of a small context). The summarized span is read again as a new prompt, so compactions are kept rare, and
+# the kept part (20K, a fifth of a small context) is read once more after each one. Sized from the smallest context
+# found. These are defaults: a value already set is kept. The default model follows the servers found, and the model
+# each one serves, which changes when you switch quants.
+[ -s "$settings" ] || echo '{}' > "$settings"
+jq --argjson found "$found" --arg thinking "$thinking" '
+    (if $thinking == "1" then .defaultThinkingLevel //= "high" else . end)
+    | .retry.maxRetries //= 1
+    | .retry.provider.timeoutMs //= 3600000
+    | .retry.provider.maxRetries //= 0
+    | if ($found | length) > 0 then
+          ([$found[].models[0].contextWindow] | min) as $ctx
+          | .compaction.enabled //= true
+          | .compaction.reserveTokens //= ([24576, ($ctx / 4 | floor)] | min)
+          | .compaction.keepRecentTokens //= ([20000, ($ctx / 5 | floor)] | min)
+      else . end
+    | if ($found | length) > 0 and ((.defaultProvider // "") as $d | $d == "" or (($d | startswith("loop")) and $found[$d].models[0].id != .defaultModel)) then
+          ($found | to_entries[0]) as $e | .defaultProvider = $e.key | .defaultModel = $e.value.models[0].id
+      else . end
+' "$settings" > "$tmp" && mv "$tmp" "$settings"
+
+n=$(jq 'length' <<<"$found")
+if [ "$n" = 0 ]; then
+    echo "loop-detect: no SenseNova Loop server answered ($searched ); pi starts without its model" >&2
+else
+    def=$(jq -r '"\(.defaultProvider)/\(.defaultModel)"' "$settings")
+    if [ "$quiet" = 1 ]; then
+        echo "loop-detect: $n SenseNova Loop server(s): $(jq -r 'to_entries | map("\(.key) \(.value.models[0].id)") | join(", ")' <<<"$found"); default $def"
+    else
+        say "wrote $models; default model $def"
+    fi
+fi

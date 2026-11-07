@@ -1,0 +1,57 @@
+;; Seatbelt profile for llama-server. It may read its own binaries and the model, use the GPU, and answer on one
+;; loopback port. It cannot start another program, connect out, or read or write anything else of yours.
+;;
+;; Parameters (given by ./loop, all canonical paths): BIN, BIN_DIR, MODEL_DIR, PORT, CACHE_DIR, TEMP_DIR, LOG_FILE
+(version 1)
+(deny default)
+(import "system.sb")
+
+(allow process-exec (literal (param "BIN")))
+(allow signal (target self))
+(allow process-info* (target self))
+(allow sysctl-read)
+(allow ipc-posix-sem ipc-posix-shm)
+(allow user-preference-read)
+
+;; Read only: the system, llama.cpp's binaries and libraries, the model
+(allow file-read-metadata)
+(allow file-read*
+    (literal "/")
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath "/usr/share")
+    (subpath "/Library/Apple")
+    (subpath "/private/etc")
+    (subpath "/private/var/db/dyld")
+    (subpath "/private/var/db/timezone")
+    (subpath (param "BIN_DIR"))
+    (subpath (param "MODEL_DIR")))
+(allow file-map-executable
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath (param "BIN_DIR")))
+(allow file-read* (subpath "/dev"))
+(allow file-write* (literal "/dev/null") (literal "/dev/dtracehelper") (literal (param "LOG_FILE")))
+
+;; Written by the Metal compiler: the per-user shader cache and temp folders
+(allow file-read* file-write* (subpath (param "CACHE_DIR")) (subpath (param "TEMP_DIR")))
+
+;; Metal. iokit-open is not narrowed to named user clients, because those names differ between GPU generations.
+(allow iokit-open)
+(allow iokit-get-properties)
+(allow mach-lookup
+    (global-name "com.apple.MTLCompilerService")
+    (xpc-service-name "com.apple.MTLCompilerService")
+    (global-name "com.apple.gpumemd.source")
+    (global-name "com.apple.cvmsServ")
+    (global-name "com.apple.PowerManagement.control")
+    (global-name "com.apple.cfprefsd.agent")
+    (global-name "com.apple.cfprefsd.daemon")
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.logger")
+    (global-name "com.apple.logd"))
+
+;; Loopback, one port, inbound only
+(allow system-socket)
+(allow network-bind network-inbound (local ip (string-append "localhost:" (param "PORT"))))

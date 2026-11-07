@@ -1,0 +1,56 @@
+;; Seatbelt profile for building llama.cpp's fork from source, with cmake and Apple's compiler. The fork's build files
+;; and code run here, so they are confined as the agent is, and more: no network at all, and writes only to the source
+;; folder and the compiler's caches. The build is made not to download anything (./loop turns off the web UI, which
+;; would), so a build that tries is refused.
+;;
+;; Parameters (given by ./loop, all canonical paths): SRC, CACHE_DIR, TEMP_DIR
+(version 1)
+(deny default)
+(import "system.sb")
+
+(allow process-exec process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+(allow ipc-posix-sem ipc-posix-shm)
+(allow user-preference-read)
+(allow file-map-executable)
+
+;; Read only: the system, the Command Line Tools or Xcode, and Homebrew's cmake
+(allow file-read-metadata)
+(allow file-read*
+    (literal "/")
+    (subpath "/System")
+    (subpath "/Library")
+    (regex #"^/Applications/Xcode[^/]*\.app/")
+    (subpath "/bin")
+    (subpath "/usr")
+    (subpath "/opt/homebrew")
+    (subpath "/Applications/CMake.app")
+    (subpath "/private/etc")
+    (subpath "/private/var/db/dyld")
+    (subpath "/private/var/db/timezone")
+    (subpath "/private/var/db/xcode_select_link")
+    (subpath "/private/var/select"))
+
+;; Read and write: the source and build folders, and the caches of xcrun and clang
+(allow file-read* file-write*
+    (subpath (param "SRC"))
+    (subpath (param "CACHE_DIR"))
+    (subpath (param "TEMP_DIR")))
+
+(allow file-read* (subpath "/dev"))
+(allow file-write*
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/dtracehelper"))
+
+(allow mach-lookup
+    (global-name "com.apple.cfprefsd.agent")
+    (global-name "com.apple.cfprefsd.daemon")
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.membership")
+    (global-name "com.apple.system.logger")
+    (global-name "com.apple.logd")
+    (global-name "com.apple.diagnosticd"))
