@@ -16,6 +16,8 @@
 
 - **"the fork's checkout is not ...":** git fetched something other than the pinned commit. Delete `.runtime/llama-src`
   and run setup again. If it happens again, do not build it.
+- **"the Metal patch does not apply":** the pinned commit and the patch no longer match, which happens only if one was
+  changed without the other. `./loop use cpu` builds without the patch.
 - **A network error during the build:** the build tried to download something, which its sandbox refuses. Report it, with
   the line it failed on.
 
@@ -30,7 +32,11 @@ log show --last 5m --style compact --predicate 'sender == "Sandbox"'
 Then allow the path or service in [`sandbox/server.sb`](../sandbox/server.sb) or [`sandbox/agent.sb`](../sandbox/agent.sb),
 as narrowly as you can.
 
-- **"sees Metal without a sandbox" fails:** the problem is the build, or the Mac, and not the sandbox.
+- **"sees Metal without a sandbox" fails:** the problem is the build, or the Mac, and not the sandbox. If the server log
+  says a Metal library failed to build, a kernel did not compile: `./loop use cpu` switches to the build without the
+  Metal patch. Please report it, with the log.
+- **"the Metal routing kernels match the CPU's" fails:** the patch's kernels compiled, but disagree with the CPU's on some
+  case. Do not use the patched build: `./loop use cpu`. Please report it, with doctor's output.
 - **Only "sees Metal in the sandbox" fails:** the server's profile is missing something Metal needs.
 - **"it can run a program at all" fails:** `sandbox-exec` could not use the profile. Run it by hand to see the error.
 - **A refusal check reports "it was allowed":** the sandbox is not doing its job. Do not rely on it until that is fixed.
@@ -53,7 +59,8 @@ small too. Use a larger context if you have the memory, or lower the thinking le
 
 ## It is slow
 
-- Part of each token runs on the CPU. See [Metal](metal.md).
+- Run `./loop models` to see the build: with `./loop use cpu`, the routing runs on the CPU, many times per token. See
+  [Metal](metal.md).
 - Check for Low Power Mode, which throttles inference hard (System Settings, Battery).
 - A long first prompt takes a while to read: `./loop bench` shows how fast your Mac reads one. Thinking at the `high`
   level can take minutes before the answer starts.

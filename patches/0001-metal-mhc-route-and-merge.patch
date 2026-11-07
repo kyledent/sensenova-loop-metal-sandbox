@@ -1,0 +1,548 @@
+Metal kernels for SenseNova Loop's two routing ops, ggml_mhc_route and ggml_mhc_merge
+
+The fork has them for the CPU and Vulkan only, so on a Mac llama.cpp ran them on the CPU, between the GPU's work, about
+a hundred times per token. These kernels follow the CPU implementation (ggml-cpu/ops.cpp), which is the reference:
+
+- kernel_mhc_route_f32: one threadgroup per token and stream. The RMS norm and the eight logits are reduced with
+  simd_sum, then one thread computes the gates and the twenty Sinkhorn passes. Unlike the Vulkan shader, the logits are
+  computed for each stream, as on the CPU (the two agree when there is one stream, as in the model).
+- kernel_mhc_merge_f32: elementwise.
+
+Both address rows through the inputs' byte strides, as the streams are views of one buffer. supports_op keeps them on
+the CPU for anything they do not handle. test-backend-ops gets cases for both, at the model's width, with views and two
+streams, so `test-backend-ops -b MTL0 -o MHC_ROUTE,MHC_MERGE` compares them with the CPU.
+
+Applies to GuideboardLabs/llama.cpp-sensenova-loop at fad174ecd8bf22746a626c58e67e193f095aaa46.
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 548b989..c03b27c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -588,6 +588,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mhc(ggml_metal_library_t lib, const ggml_tensor * op) {
++    const char * name = nullptr;
++
++    switch (op->op) {
++        case GGML_OP_MHC_ROUTE: name = "kernel_mhc_route_f32"; break;
++        case GGML_OP_MHC_MERGE: name = "kernel_mhc_merge_f32"; break;
++        default:
++            GGML_ABORT("fatal error");
++    }
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
+         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 1858e7f..988ab4c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -128,6 +128,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_mask        (ggml_metal_library_t lib, const struct ggml_tensor * op, bool fill, bool has_score, bool has_blocks, bool has_extra, bool vec);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mhc               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 3d4ebf8..9bdc559 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1836,6 +1836,29 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                 ggml_is_contiguous_rows(op->src[1]) &&
+                 ggml_is_contiguous_rows(op->src[2]) &&
+                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
++        case GGML_OP_MHC_ROUTE:
++            return has_simdgroup_reduction &&
++                op->src[0]->type == GGML_TYPE_F32 &&
++                op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 &&
++                op->src[3]->type == GGML_TYPE_F32 &&
++                op->type         == GGML_TYPE_F32 &&
++                ggml_is_contiguous_rows(op->src[0]) &&
++                ggml_is_contiguous_rows(op->src[1]) &&
++                ggml_is_contiguous_rows(op->src[2]) &&
++                ggml_is_contiguous(op->src[3]) &&
++                ggml_is_contiguous_rows(op);
++        case GGML_OP_MHC_MERGE:
++            return op->src[0]->type == GGML_TYPE_F32 &&
++                op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 &&
++                op->src[3]->type == GGML_TYPE_F32 &&
++                op->type         == GGML_TYPE_F32 &&
++                ggml_is_contiguous_rows(op->src[0]) &&
++                ggml_is_contiguous_rows(op->src[1]) &&
++                ggml_is_contiguous_rows(op->src[2]) &&
++                ggml_is_contiguous_rows(op->src[3]) &&
++                ggml_is_contiguous_rows(op);
+         case GGML_OP_TOP_K_MASK:
+             return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                 op->src[0]->type == op->type &&
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 6e56608..2fa9e06 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1373,6 +1373,31 @@ typedef struct {
+     uint64_t nb_d2;
+ } ggml_metal_kargs_dsv4_hc_post;
+ 
++typedef struct {
++    int32_t  n_embd;
++    uint64_t nb_a1;
++    uint64_t nb_a2;
++    uint64_t nb_b1;
++    uint64_t nb_b2;
++    uint64_t nb_w1;
++    uint64_t nb_d1;
++    uint64_t nb_d2;
++} ggml_metal_kargs_mhc_route;
++
++typedef struct {
++    int32_t  n_embd;
++    uint64_t nb_a1;
++    uint64_t nb_a2;
++    uint64_t nb_b1;
++    uint64_t nb_b2;
++    uint64_t nb_x1;
++    uint64_t nb_x2;
++    uint64_t nb_p1;
++    uint64_t nb_p2;
++    uint64_t nb_d1;
++    uint64_t nb_d2;
++} ggml_metal_kargs_mhc_merge;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 35e3dad..1e6dd8e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -355,6 +355,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
+             } break;
++        case GGML_OP_MHC_ROUTE:
++        case GGML_OP_MHC_MERGE:
++            {
++                n_fuse = ggml_metal_op_mhc(ctx, idx);
++            } break;
+         case GGML_OP_SOFT_MAX:
+             {
+                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
+@@ -1685,6 +1690,96 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++// SenseNova Loop's residual-stream routing, as ggml-cpu computes it (see ggml_compute_forward_mhc_route/_merge)
++int ggml_metal_op_mhc(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_encoder_t enc = ctx->enc;
++    auto pipeline = ggml_metal_library_get_pipeline_mhc(ctx->lib, op);
++
++    const ggml_tensor * a = op->src[0];
++    const ggml_tensor * b = op->src[1];
++
++    const int32_t n_embd  = (int32_t) a->ne[0];
++    const int     nth_max = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++
++    switch (op->op) {
++        case GGML_OP_MHC_ROUTE:
++            {
++                const ggml_tensor * w    = op->src[2];
++                const ggml_tensor * bias = op->src[3];
++
++                GGML_ASSERT(w->ne[0] == 2*a->ne[0] && w->ne[1] == 8);
++                GGML_ASSERT(op->ne[0] == a->ne[0] + 6);
++
++                ggml_metal_kargs_mhc_route args = {
++                    /*.n_embd =*/ n_embd,
++                    /*.nb_a1  =*/ a->nb[1],
++                    /*.nb_a2  =*/ a->nb[2],
++                    /*.nb_b1  =*/ b->nb[1],
++                    /*.nb_b2  =*/ b->nb[2],
++                    /*.nb_w1  =*/ w->nb[1],
++                    /*.nb_d1  =*/ op->nb[1],
++                    /*.nb_d2  =*/ op->nb[2],
++                };
++
++                ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(a),    1);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(b),    2);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w),    3);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   5);
++
++                // One threadgroup per token and stream, of whole SIMD groups. Its memory holds each SIMD group's
++                // nine partial sums, then the eight gates.
++                const int nth = std::max(32, nth_max - nth_max % 32);
++                const int nsg = nth/32;
++
++                ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((9*nsg + 8)*sizeof(float), 16), 0);
++                ggml_metal_encoder_dispatch_threadgroups(enc, a->ne[1], a->ne[2], 1, nth, 1, 1);
++            } break;
++        case GGML_OP_MHC_MERGE:
++            {
++                const ggml_tensor * x      = op->src[2];
++                const ggml_tensor * packed = op->src[3];
++
++                GGML_ASSERT(packed->ne[0] == a->ne[0] + 6);
++                GGML_ASSERT(op->ne[0] == 2*a->ne[0]);
++
++                ggml_metal_kargs_mhc_merge args = {
++                    /*.n_embd =*/ n_embd,
++                    /*.nb_a1  =*/ a->nb[1],
++                    /*.nb_a2  =*/ a->nb[2],
++                    /*.nb_b1  =*/ b->nb[1],
++                    /*.nb_b2  =*/ b->nb[2],
++                    /*.nb_x1  =*/ x->nb[1],
++                    /*.nb_x2  =*/ x->nb[2],
++                    /*.nb_p1  =*/ packed->nb[1],
++                    /*.nb_p2  =*/ packed->nb[2],
++                    /*.nb_d1  =*/ op->nb[1],
++                    /*.nb_d2  =*/ op->nb[2],
++                };
++
++                ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(a),      1);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(b),      2);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),      3);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(packed), 4);
++                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),     5);
++
++                // Elementwise: one thread per element of a row, a row per token and stream
++                const int nth = std::min(nth_max, (int) n_embd);
++                ggml_metal_encoder_dispatch_threadgroups(enc, (n_embd + nth - 1)/nth, a->ne[1], a->ne[2], nth, 1, 1);
++            } break;
++        default:
++            GGML_ABORT("fatal error");
++    }
++
++    return 1;
++}
++
+ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 0a77d8d..d15c65f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -62,6 +62,7 @@ int ggml_metal_op_diag              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_top_k_mask        (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_mhc               (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 5dfd4a6..75018b8 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -1002,3 +1002,178 @@ typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_f_t;
+ 
+ template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
+ template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
++
++// SenseNova Loop's residual-stream routing (ggml_mhc_route, ggml_mhc_merge), computed as ggml-cpu does. The streams
++// may be views, so rows are addressed with their byte strides; elements inside a row are contiguous.
++
++// One threadgroup per token and stream: an RMS norm over the two streams together and the eight router logits, then,
++// on one thread, the four gates and twenty Sinkhorn passes over the 2x2 mixing matrix in log space. Writes the
++// pre-weighted branch, then the two output gates and the mixing matrix that kernel_mhc_merge_f32 reads.
++kernel void kernel_mhc_route_f32(
++        constant ggml_metal_kargs_mhc_route & args,
++        device const char * a,
++        device const char * b,
++        device const char * w,
++        device const char * bias,
++        device       char * dst,
++        threadgroup float * shmem [[threadgroup(0)]],
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint  sgitg[[simdgroup_index_in_threadgroup]],
++        uint  tiisg[[thread_index_in_simdgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int d  = args.n_embd;
++    const int it = tgpig.x;
++    const int is = tgpig.y;
++
++    device const float * va = (device const float *) (a + it*args.nb_a1 + is*args.nb_a2);
++    device const float * vb = (device const float *) (b + it*args.nb_b1 + is*args.nb_b2);
++
++    float ss = 0.0f;
++    float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
++
++    for (int i = (int) tpitg.x; i < d; i += (int) ntg.x) {
++        const float xa = va[i];
++        const float xb = vb[i];
++
++        ss += xa*xa + xb*xb;
++
++        FOR_UNROLL (int k = 0; k < 8; ++k) {
++            device const float * wk = (device const float *) (w + k*args.nb_w1);
++            acc[k] += wk[i]*xa + wk[d + i]*xb;
++        }
++    }
++
++    // Each SIMD group's sums, then the threadgroup's, on one thread
++    ss = simd_sum(ss);
++    FOR_UNROLL (int k = 0; k < 8; ++k) {
++        acc[k] = simd_sum(acc[k]);
++    }
++
++    const int nsg = (int) (ntg.x + N_SIMDWIDTH - 1)/N_SIMDWIDTH;
++    threadgroup float * gates = shmem + 9*nsg;
++
++    if (tiisg == 0) {
++        shmem[9*sgitg + 0] = ss;
++        FOR_UNROLL (int k = 0; k < 8; ++k) {
++            shmem[9*sgitg + 1 + k] = acc[k];
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tpitg.x == 0) {
++        float tot[9];
++        for (int j = 0; j < 9; ++j) {
++            tot[j] = 0.0f;
++            for (int g = 0; g < nsg; ++g) {
++                tot[j] += shmem[9*g + j];
++            }
++        }
++
++        device const float * pb = (device const float *) bias;
++
++        const float rms = 1.0f/sqrt(tot[0]/(2.0f*d) + 1e-6f);
++
++        float lg[8];
++        FOR_UNROLL (int k = 0; k < 8; ++k) {
++            lg[k] = tot[1 + k]*rms + pb[k];
++        }
++
++        gates[0] = 1.0f/(1.0f + precise::exp(-lg[0]));
++        gates[1] = 1.0f/(1.0f + precise::exp(-lg[1]));
++        gates[2] = 2.0f/(1.0f + precise::exp(-lg[2]));
++        gates[3] = 2.0f/(1.0f + precise::exp(-lg[3]));
++
++        float m00 = lg[4];
++        float m01 = lg[5];
++        float m10 = lg[6];
++        float m11 = lg[7];
++
++        // rows, then columns, as trained
++        for (int iter = 0; iter < 20; ++iter) {
++            float mx;
++            float lse;
++
++            mx  = max(m00, m01);
++            lse = mx + precise::log(precise::exp(m00 - mx) + precise::exp(m01 - mx));
++            m00 -= lse;
++            m01 -= lse;
++
++            mx  = max(m10, m11);
++            lse = mx + precise::log(precise::exp(m10 - mx) + precise::exp(m11 - mx));
++            m10 -= lse;
++            m11 -= lse;
++
++            mx  = max(m00, m10);
++            lse = mx + precise::log(precise::exp(m00 - mx) + precise::exp(m10 - mx));
++            m00 -= lse;
++            m10 -= lse;
++
++            mx  = max(m01, m11);
++            lse = mx + precise::log(precise::exp(m01 - mx) + precise::exp(m11 - mx));
++            m01 -= lse;
++            m11 -= lse;
++        }
++
++        gates[4] = precise::exp(m00);
++        gates[5] = precise::exp(m01);
++        gates[6] = precise::exp(m10);
++        gates[7] = precise::exp(m11);
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    const float pre0 = gates[0];
++    const float pre1 = gates[1];
++
++    device float * po = (device float *) (dst + it*args.nb_d1 + is*args.nb_d2);
++
++    for (int i = (int) tpitg.x; i < d; i += (int) ntg.x) {
++        po[i] = pre0*va[i] + pre1*vb[i];
++    }
++
++    if (tpitg.x < 6) {
++        po[d + tpitg.x] = gates[2 + tpitg.x];
++    }
++}
++
++// Mixes the two streams with the router's 2x2 matrix, and adds the sublayer's output to each, gated: one thread per
++// element of a row, and a row of threadgroups per token and stream.
++kernel void kernel_mhc_merge_f32(
++        constant ggml_metal_kargs_mhc_merge & args,
++        device const char * a,
++        device const char * b,
++        device const char * x,
++        device const char * packed,
++        device       char * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int d  = args.n_embd;
++    const int i  = tgpig.x*ntg.x + tpitg.x;
++    const int it = tgpig.y;
++    const int is = tgpig.z;
++
++    if (i >= d) {
++        return;
++    }
++
++    device const float * pp = (device const float *) (packed + it*args.nb_p1 + is*args.nb_p2);
++
++    const float post0 = pp[d + 0];
++    const float post1 = pp[d + 1];
++    const float m00   = pp[d + 2];
++    const float m01   = pp[d + 3];
++    const float m10   = pp[d + 4];
++    const float m11   = pp[d + 5];
++
++    const float va = ((device const float *) (a + it*args.nb_a1 + is*args.nb_a2))[i];
++    const float vb = ((device const float *) (b + it*args.nb_b1 + is*args.nb_b2))[i];
++    const float vx = ((device const float *) (x + it*args.nb_x1 + is*args.nb_x2))[i];
++
++    device float * po = (device float *) (dst + it*args.nb_d1 + is*args.nb_d2);
++
++    po[i]     = m00*va + m01*vb + post0*vx;
++    po[d + i] = m10*va + m11*vb + post1*vx;
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f75ff11..df3fd6a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4719,6 +4719,92 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
+ };
+ 
+ 
++// GGML_OP_MHC_ROUTE and GGML_OP_MHC_MERGE (SenseNova Loop). In the model, the two streams are the halves of one
++// buffer, so with `view` they are views of one tensor, as there.
++struct test_mhc : public test_case {
++    const int64_t n_embd;
++    const int64_t n_tokens;
++    const int64_t n_streams;
++    const bool    view;
++
++    std::string vars() override {
++        return VARS_TO_STR4(n_embd, n_tokens, n_streams, view);
++    }
++
++    test_mhc(int64_t n_embd, int64_t n_tokens, int64_t n_streams, bool view)
++        : n_embd(n_embd), n_tokens(n_tokens), n_streams(n_streams), view(view) {}
++
++    void build_streams(ggml_context * ctx, ggml_tensor ** a, ggml_tensor ** b) {
++        if (view) {
++            ggml_tensor * ab = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_embd, n_tokens, n_streams);
++            ggml_set_name(ab, "ab");
++            *a = ggml_view_3d(ctx, ab, n_embd, n_tokens, n_streams, ab->nb[1], ab->nb[2], 0);
++            *b = ggml_view_3d(ctx, ab, n_embd, n_tokens, n_streams, ab->nb[1], ab->nb[2], n_embd*sizeof(float));
++        } else {
++            *a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_streams);
++            *b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_streams);
++        }
++        ggml_set_name(*a, "a");
++        ggml_set_name(*b, "b");
++    }
++
++    // The router's weights are small, as trained, so that its logits stay in the range where the gates vary
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->view_src) {
++                continue;
++            }
++            if (std::string(ggml_get_name(t)) == "w") {
++                init_tensor_uniform(t, -0.05f, 0.05f);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
++struct test_mhc_route : public test_mhc {
++    test_mhc_route(int64_t n_embd = 64, int64_t n_tokens = 3, int64_t n_streams = 1, bool view = false)
++        : test_mhc(n_embd, n_tokens, n_streams, view) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a;
++        ggml_tensor * b;
++        build_streams(ctx, &a, &b);
++
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_embd, 8);
++        ggml_set_name(w, "w");
++
++        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
++        ggml_set_name(bias, "bias");
++
++        ggml_tensor * out = ggml_mhc_route(ctx, a, b, w, bias);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++struct test_mhc_merge : public test_mhc {
++    test_mhc_merge(int64_t n_embd = 64, int64_t n_tokens = 3, int64_t n_streams = 1, bool view = false)
++        : test_mhc(n_embd, n_tokens, n_streams, view) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a;
++        ggml_tensor * b;
++        build_streams(ctx, &a, &b);
++
++        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_streams);
++        ggml_set_name(x, "x");
++
++        ggml_tensor * packed = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd + 6, n_tokens, n_streams);
++        ggml_set_name(packed, "packed");
++
++        ggml_tensor * out = ggml_mhc_merge(ctx, a, b, x, packed);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_SSM_CONV
+ struct test_ssm_conv : public test_case {
+     const ggml_type type;
+@@ -10139,6 +10225,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
+     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+ 
++    // SenseNova Loop's router and merge: its width (4096) for one token and for a prompt batch, a width that is not a
++    // multiple of a SIMD group, and two streams
++    for (bool view : {false, true}) {
++        for (auto [n_embd, n_tokens, n_streams] : std::vector<std::array<int64_t, 3>>{{64, 1, 1}, {4096, 1, 1}, {4096, 33, 1}, {100, 7, 2}}) {
++            test_cases.emplace_back(new test_mhc_route(n_embd, n_tokens, n_streams, view));
++            test_cases.emplace_back(new test_mhc_merge(n_embd, n_tokens, n_streams, view));
++        }
++    }
++
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         // blocks with extra cells and scores (k-pool)
+         test_cases.emplace_back(new test_top_k_mask(type));

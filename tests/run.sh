@@ -41,10 +41,16 @@ for c in text:
     if depth < 0: sys.exit(1)
 sys.exit(depth != 0)' "$1"; }
 for f in sandbox/server.sb sandbox/agent.sb sandbox/build.sb; do check "balanced parens $f" balanced "$SRC/$f"; done
+if command -v "${CXX:-c++}" >/dev/null 2>&1; then
+    check "the Metal patch's kernels, run on the CPU, match the fork's CPU code" sh -c \
+        '"$0/tests/metal-kernels.sh" "$1" >/dev/null' "$SRC" "${CXX:-c++}"
+else
+    echo "skip  the Metal patch's kernels: no C++ compiler (set CXX)"
+fi
 
 # --- A copy of the repo, with stubs for what only a Mac has, and for what setup would download
 mkdir -p "$WORK/stubs" "$WORK/repo"
-cp -R "$SRC/loop" "$SRC/agent" "$SRC/sandbox" "$SRC/.env.example" "$WORK/repo/"
+cp -R "$SRC/loop" "$SRC/agent" "$SRC/sandbox" "$SRC/patches" "$SRC/.env.example" "$WORK/repo/"
 cd "$WORK/repo" || exit 1
 stub() { printf '#!/bin/bash\n%s\n' "$2" > "$WORK/stubs/$1"; chmod +x "$WORK/stubs/$1"; }
 stub uname 'case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac'
@@ -64,7 +70,9 @@ done
 echo \"exec \$*\" >> \"\$log\"
 echo \"cwd \$(pwd -P)\" >> \"\$log\"
 exec \"\$@\""
-LLAMA_DIR=.runtime/llama/${COMMIT:0:12}
+# The build has a folder of its own for the commit and the version of the Metal patch
+RUNTIME_ID=${COMMIT:0:12}-metal-$(shasum -a 256 "$SRC/patches/0001-metal-mhc-route-and-merge.patch" | cut -c 1-8)
+LLAMA_DIR=.runtime/llama/$RUNTIME_ID
 stub ps "kill -0 \"\$2\" 2>/dev/null || exit 1; echo '$(pwd -P)/$LLAMA_DIR/llama-server'"
 # The agent's PATH holds jq's folder, so these two reach it wherever this machine keeps them (jq.exe: without its CRs)
 stub curl "exec '$(command -v curl)' \"\$@\""
@@ -95,7 +103,7 @@ case \"\$*\" in
     'init -q '*) mkdir -p \"\$3/.git\" ;;
 esac"
 stub cmake "echo \"cmake \$*\" >> '$WORK/cmake.log'
-case \"\$*\" in *--build*) mkdir -p build/bin && cp '$WORK/llama-server.mock' build/bin/llama-server ;; esac"
+case \"\$*\" in *--build*) mkdir -p build/bin && cp '$WORK/llama-server.mock' build/bin/llama-server && printf '#!/bin/bash\n' > build/bin/test-backend-ops && chmod +x build/bin/test-backend-ops ;; esac"
 stub wc 'echo 5628723360'
 : > "$WORK/wrong-commit"
 check "setup refuses a checkout that is not the pinned commit" sh -c '! ./loop setup >/dev/null 2>&1'
@@ -105,12 +113,19 @@ check "build: fetches the pinned commit of the fork" contains "$WORK/git.log" \
     "fetch -q --depth 1 https://github.com/GuideboardLabs/llama.cpp-sensenova-loop.git $COMMIT"
 check "build: static, with Metal, and without the web UI's download" contains "$WORK/cmake.log" \
     "-DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON .*-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
-check "build: only the server" contains "$WORK/cmake.log" "--build build --target llama-server -j 8"
+check "build: applies the Metal patch, after checking that it applies" sh -c \
+    "grep -q 'apply --check .*/patches/0001-metal-mhc-route-and-merge.patch' '$WORK/git.log' && grep -q 'apply .*/patches/0001-metal-mhc-route-and-merge.patch\$' '$WORK/git.log'"
+check "build: the server, and the test that compares the kernels with the CPU's" sh -c \
+    "grep -q -- '-DLLAMA_BUILD_TESTS=ON ' '$WORK/cmake.log' && grep -q -- '--build build --target llama-server test-backend-ops -j 8' '$WORK/cmake.log'"
 check "build: in its sandbox" contains "$WORK/sandbox.log" 'profile .*sandbox/build.sb'
 check "build: the sandbox may write the source folder" contains "$WORK/sandbox.log" 'param SRC=.*/.runtime/llama-src'
-check "build: the server is installed" test -x "$LLAMA_DIR/llama-server"
+check "build: the server and the test are installed" sh -c "test -x '$LLAMA_DIR/llama-server' && test -x '$LLAMA_DIR/test-backend-ops'"
 : > "$WORK/cmake.log"
 check "setup does not build again" sh -c "./loop setup >/dev/null && ! grep -q . '$WORK/cmake.log'"
+: > "$WORK/git.log"
+check "LOOP_METAL_PORT=0 builds without the patch" sh -c "LOOP_METAL_PORT=0 ./loop setup >/dev/null && ! grep -q apply '$WORK/git.log'"
+check "without the patch: the server only, and a folder of its own" sh -c \
+    "grep -q -- '-DLLAMA_BUILD_TESTS=OFF ' '$WORK/cmake.log' && grep -q -- '--target llama-server -j 8' '$WORK/cmake.log' && test -x .runtime/llama/${COMMIT:0:12}/llama-server"
 rm -f "$WORK/stubs/git" "$WORK/stubs/cmake" "$WORK/stubs/xcrun" "$WORK/stubs/wc"
 
 # --- Server start and flags
@@ -229,7 +244,7 @@ check "check: thinking off is asked for, with no sampling of its own" sh -c \
 check "./loop bench measures each size" sh -c './loop bench 512 2048 > "$0/bench.out"' "$WORK"
 check "bench: a row per size" sh -c 'test "$(grep -cE "^  [0-9]+ +500 tokens/s +[0-9.]+ s +20 tokens/s \(128 tokens\)" "$0/bench.out")" -eq 2' "$WORK"
 check "bench: results kept, with the model, the runtime and speeds" sh -c \
-    "jq -es 'length == 2 and all(.model == \"sensenova-loop-9b-q4-k-m\" and .runtime == \"${COMMIT:0:12}\" and .prefill_tps == 500 and .generation_tps == 20 and .generated_tokens == 128)' .state/bench.jsonl >/dev/null"
+    "jq -es 'length == 2 and all(.model == \"sensenova-loop-9b-q4-k-m\" and .runtime == \"$RUNTIME_ID\" and .prefill_tps == 500 and .generation_tps == 20 and .generated_tokens == 128)' .state/bench.jsonl >/dev/null"
 check "bench refuses a size that is not a number" sh -c '! ./loop bench lots 2>/dev/null'
 LOOP_SERVER_ARGS="--overflow-text=context-too-long --think-tokens=30000" ./loop restart >/dev/null
 check "check fails when pi would miss an overflow, or a summary is cut off" sh -c '! ./loop check > "$0/check.out"' "$WORK"
@@ -265,6 +280,15 @@ echo 137438953472 > "$WORK/memsize"
 check "./loop use Q4_K_M auto goes back" sh -c './loop use Q4_K_M auto >/dev/null'
 check "use: auto empties the context" contains .env '^LOOP_CTX=$'
 check "use: the context by RAM again" sh -c './loop status | grep -q "ready: sensenova-loop-9b-q4-k-m, ctx 131072"'
+: > "$WORK/sandbox.log"
+check "./loop use cpu switches to the build without the Metal patch" sh -c './loop use cpu >/dev/null'
+check "use: .env keeps it" contains .env '^LOOP_METAL_PORT=0$'
+check "use: the server runs from that build" contains "$WORK/sandbox.log" "exec .*/.runtime/llama/${COMMIT:0:12}/llama-server "
+check "use: ./loop models names the build" sh -c "./loop models | grep -q 'Build: ${COMMIT:0:12}, with the routing on the CPU'"
+: > "$WORK/sandbox.log"
+check "./loop use metal goes back" sh -c './loop use metal >/dev/null'
+check "use: the server runs from the patched build" contains "$WORK/sandbox.log" "exec .*/$LLAMA_DIR/llama-server "
+check "use: .env keeps that too" contains .env '^LOOP_METAL_PORT=1$'
 
 # --- One of ours whose pid file is gone: found by its port
 ORPHAN=$(cat .state/server.pid)

@@ -19,8 +19,8 @@ LOG_FILE="$STATE/server.log"
 LLAMA_REPO=https://github.com/GuideboardLabs/llama.cpp-sensenova-loop.git
 LLAMA_COMMIT=fad174ecd8bf22746a626c58e67e193f095aaa46
 LLAMA_SRC="$RUNTIME/llama-src"
-LLAMA_DIR="$RUNTIME/llama/${LLAMA_COMMIT:0:12}"
-LLAMA_SERVER="$LLAMA_DIR/llama-server"
+# Metal kernels for the fork's two routing ops, which it has for the CPU and Vulkan only. See docs/metal.md.
+METAL_PATCH="$ROOT/patches/0001-metal-mhc-route-and-merge.patch"
 
 # The fork author's GGUFs, made with its converter: text only, the looped block stored once
 HF_REPO=guideboardlabs/SenseNova-Loop-9B-Preview-GGUF
@@ -85,7 +85,7 @@ load_config() {
     local key
     SHELL_QUANT=$(echo "${LOOP_QUANT:-}" | tr 'a-z' 'A-Z')   # asked for on this command line, unlike one in .env
     SHELL_OVERRIDES=""   # what the shell sets, which wins over what ./loop use writes to .env
-    for key in LOOP_QUANT LOOP_CTX; do
+    for key in LOOP_QUANT LOOP_CTX LOOP_METAL_PORT; do
         [ -z "${!key+x}" ] || SHELL_OVERRIDES="$SHELL_OVERRIDES $key"
     done
     load_env
@@ -100,8 +100,19 @@ load_config() {
     case "$NETWORK" in server|loopback|open) ;; *) die "LOOP_AGENT_NETWORK must be server, loopback or open, not $NETWORK" ;; esac
     PI_VERSION="${PI_VERSION:-0.73.1}"
     PI_DIR="$RUNTIME/pi"
+    runtime_paths
     BASE_URL="http://127.0.0.1:$PORT"
     SANDBOX_EXEC=$(command -v sandbox-exec) || die "sandbox-exec not found: this needs macOS"
+}
+
+# The build in use: a folder of its own for each commit, and for each version of the Metal patch
+runtime_paths() {
+    METAL_PORT="${LOOP_METAL_PORT:-1}"
+    RUNTIME_ID=${LLAMA_COMMIT:0:12}
+    if [ "$METAL_PORT" != 0 ]; then RUNTIME_ID="$RUNTIME_ID-metal-$(shasum -a 256 "$METAL_PATCH" | cut -c 1-8)"; fi
+    LLAMA_DIR="$RUNTIME/llama/$RUNTIME_ID"
+    LLAMA_SERVER="$LLAMA_DIR/llama-server"
+    LLAMA_TESTS="$LLAMA_DIR/test-backend-ops"
 }
 
 # "8080-8083 8100" -> 8080 8081 8082 8083 8100
@@ -171,18 +182,25 @@ download() {
     mv "$part" "$dest"
 }
 
-# Fetches the pinned commit, checks that it is the one asked for, and builds llama-server from it: one static binary with
-# Metal's shaders inside, and without the web UI, which the build would download. The build runs in sandbox/build.sb,
-# with a clean environment: no network, and it writes only its own folder and the compiler's caches.
-# LOOP_BUILD_SANDBOX=0 builds without the sandbox.
+# Fetches the pinned commit, checks that it is the one asked for, applies the Metal patch, and builds llama-server from
+# it: one static binary with Metal's shaders inside, and without the web UI, which the build would download. With the
+# patch, it also builds test-backend-ops, which compares the patch's kernels with the CPU's. The build runs in
+# sandbox/build.sb, with a clean environment: no network, and it writes only its own folder and the compiler's caches.
+# LOOP_BUILD_SANDBOX=0 builds without the sandbox, and LOOP_METAL_PORT=0 without the patch.
 build_llama() {
-    local cache temp src cmake_bin run=()
-    echo "Building llama.cpp's SenseNova Loop fork at ${LLAMA_COMMIT:0:12}. This takes a few minutes."
+    local cache temp src cmake_bin tests=OFF targets=(llama-server) run=()
+    echo "Building llama.cpp's SenseNova Loop fork at $RUNTIME_ID. This takes a few minutes."
     if [ ! -d "$LLAMA_SRC/.git" ]; then rm -rf "$LLAMA_SRC"; git init -q "$LLAMA_SRC"; fi
     git -C "$LLAMA_SRC" fetch -q --depth 1 "$LLAMA_REPO" "$LLAMA_COMMIT"
     git -C "$LLAMA_SRC" -c advice.detachedHead=false checkout -q --force FETCH_HEAD
     [ "$(git -C "$LLAMA_SRC" rev-parse HEAD)" = "$LLAMA_COMMIT" ] || die "the fork's checkout is not $LLAMA_COMMIT"
     git -C "$LLAMA_SRC" clean -qfdx -e build
+    if [ "$METAL_PORT" != 0 ]; then
+        git -C "$LLAMA_SRC" apply --check "$METAL_PATCH" 2>/dev/null \
+            || die "the Metal patch does not apply to $LLAMA_COMMIT. ./loop use cpu builds without it"
+        git -C "$LLAMA_SRC" apply "$METAL_PATCH"
+        tests=ON; targets+=(test-backend-ops)
+    fi
     cache=$(cd "$(getconf DARWIN_USER_CACHE_DIR)" && pwd -P)
     temp=$(cd "$(getconf DARWIN_USER_TEMP_DIR)" && pwd -P)
     src=$(cd "$LLAMA_SRC" && pwd -P)
@@ -194,13 +212,16 @@ build_llama() {
         "LANG=${LANG:-en_US.UTF-8}" ${run[@]+"${run[@]}"})
     ( cd "$src" \
         && "${run[@]}" "$cmake_bin" -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS="$tests" \
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
-        && "${run[@]}" "$cmake_bin" --build build --target llama-server -j "$(sysctl -n hw.ncpu)" ) \
+        && "${run[@]}" "$cmake_bin" --build build --target "${targets[@]}" -j "$(sysctl -n hw.ncpu)" ) \
         || die "the build failed. If the sandbox refused something, LOOP_BUILD_SANDBOX=0 ./loop setup builds without it"
-    [ -x "$src/build/bin/llama-server" ] || die "the build made no build/bin/llama-server"
+    local target
+    for target in "${targets[@]}"; do
+        [ -x "$src/build/bin/$target" ] || die "the build made no build/bin/$target"
+    done
     rm -rf "$LLAMA_DIR"; mkdir -p "$LLAMA_DIR"
-    cp "$src/build/bin/llama-server" "$LLAMA_SERVER"
+    for target in "${targets[@]}"; do cp "$src/build/bin/$target" "$LLAMA_DIR/"; done
 }
 
 cmd_setup() {
@@ -234,9 +255,10 @@ require_setup() {
     mkdir -p "$STATE" "$WORKSPACE"
 }
 
-# Sets SERVER_SANDBOX to the command line that runs a program in the server's sandbox, with a clean environment
+# Sets SERVER_SANDBOX to the command line that runs a program in the server's sandbox, with a clean environment: by
+# default llama-server, or another of the build's programs
 server_sandbox() {
-    local cache temp
+    local bin=${1:-$LLAMA_SERVER} cache temp
     cache=$(cd "$(getconf DARWIN_USER_CACHE_DIR)" && pwd -P)
     temp=$(cd "$(getconf DARWIN_USER_TEMP_DIR)" && pwd -P)
     mkdir -p "$MODEL_DIR"
@@ -246,7 +268,7 @@ server_sandbox() {
     # Prism ML's workaround for an out-of-memory error in ggml's Metal backend on M5 with macOS 26.2 to 26.4
     if [ -n "${GGML_METAL_TENSOR_DISABLE:-}" ]; then SERVER_SANDBOX+=("GGML_METAL_TENSOR_DISABLE=$GGML_METAL_TENSOR_DISABLE"); fi
     SERVER_SANDBOX+=("$SANDBOX_EXEC" -f "$ROOT/sandbox/server.sb"
-        -D "BIN=$LLAMA_SERVER" -D "BIN_DIR=$LLAMA_DIR" -D "MODEL_DIR=$(cd "$MODEL_DIR" && pwd -P)" -D "PORT=$PORT"
+        -D "BIN=$bin" -D "BIN_DIR=$LLAMA_DIR" -D "MODEL_DIR=$(cd "$MODEL_DIR" && pwd -P)" -D "PORT=$PORT"
         -D "CACHE_DIR=$cache" -D "TEMP_DIR=$temp" -D "LOG_FILE=$LOG_FILE")
 }
 
@@ -278,14 +300,14 @@ server_wants_key() {
 cmd_up() {
     require_setup
     if server_pid >/dev/null; then
-        local running
+        local running wanted="$QUANT $RUNTIME_ID"
         running=$(cat "$MODEL_MARKER" 2>/dev/null || echo unknown)
-        if [ "$running" = "$QUANT" ]; then
+        if [ "$running" = "$wanted" ]; then
             echo "Server already running on port $PORT"
         elif [ -n "$SHELL_QUANT" ]; then
-            die "the server is running $running, not $QUANT. To switch: ./loop use $QUANT"
+            die "the server is running $running, not $wanted. To switch: ./loop use $QUANT"
         else
-            echo "Server already running $running on port $PORT (.env says $QUANT; ./loop use $QUANT switches to it)"
+            echo "Server already running $running on port $PORT (.env says $wanted; ./loop restart switches to it)"
         fi
     elif server_healthy; then
         echo "Something else already serves port $PORT; using it"
@@ -305,7 +327,7 @@ cmd_up() {
         # From its own folder: ggml lists the current one for backends, and the sandbox refuses this repository's
         ( cd "$LLAMA_DIR" && exec nohup "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1 < /dev/null ) &
         echo $! > "$PID_FILE"
-        echo "$QUANT" > "$MODEL_MARKER"
+        echo "$QUANT $RUNTIME_ID" > "$MODEL_MARKER"
         echo "Starting the $QUANT server on port $PORT (log: $LOG_FILE)"
     fi
     local waited=0 limit="${LOOP_START_TIMEOUT:-300}"
@@ -385,12 +407,13 @@ cmd_models() {
         state="not downloaded"
         if [ -f "$MODEL_DIR/$MODEL_FILE" ]; then state=downloaded; fi
         if [ "$q" = "$QUANT" ]; then state="$state, selected"; fi
-        if [ "$q" = "$running" ]; then state="$state, running"; fi
+        if [ "$q" = "${running%% *}" ]; then state="$state, running"; fi
         printf '  %-8s %-9s %s (%s)\n' "$q" "$(( MODEL_SIZE / 1000000 )) MB" "$MODEL_FILE" "$state"
     done
     load_quant "$QUANT"
     echo
-    echo "To switch: ./loop use Q4_0, or a context (32K, or auto), or both"
+    echo "Build: $RUNTIME_ID, with the routing on $([ "$METAL_PORT" = 0 ] && echo the CPU || echo Metal)"
+    echo "To switch: ./loop use Q4_0, or a context (32K, or auto), or cpu or metal for the routing, in any combination"
 }
 
 # Sets KEY=VALUE in .env, in place of the first KEY= line, or at the end
@@ -416,19 +439,22 @@ fit_warning() {
     fi
 }
 
-# ./loop use [Q4_K_M|Q4_0|Q3_K_M] [32K|32768|auto], in either order: downloads what that needs while the running server
-# keeps serving, keeps the choice in .env, and restarts the server with it. If the new server does not start, .env and
-# the previous server come back.
+# ./loop use [Q4_K_M|Q4_0|Q3_K_M] [32K|32768|auto] [metal|cpu], in any order: builds and downloads what that needs
+# while the running server keeps serving, keeps the choice in .env, and restarts the server with it. If the new server
+# does not start, .env and the previous server come back. metal and cpu choose the build with or without the Metal
+# patch, which runs the model's routing on the GPU or the CPU.
 cmd_use() {
-    local arg up quant="" ctx="" ctx_set=0
-    [ $# -gt 0 ] || die "use: name a quant (Q4_K_M, Q4_0 or Q3_K_M) or a context (32K, or auto)"
+    local arg up quant="" ctx="" ctx_set=0 port=""
+    [ $# -gt 0 ] || die "use: name a quant (Q4_K_M, Q4_0 or Q3_K_M), a context (32K, or auto), or metal or cpu"
     for arg in "$@"; do
         up=$(echo "$arg" | tr 'a-z' 'A-Z')
         case "$up" in
             Q4_K_M|Q4KM|Q4_0|Q3_K_M|Q3KM) quant=$(echo "$up" | sed 's/^Q\([0-9]\)KM$/Q\1_K_M/') ;;
             AUTO) ctx=""; ctx_set=1 ;;
+            METAL) port=1 ;;
+            CPU|NOMETAL) port=0 ;;
             *)
-                [[ $up =~ ^[0-9]+K?$ ]] || die "use: $arg is not a quant (Q4_K_M, Q4_0 or Q3_K_M) or a context"
+                [[ $up =~ ^[0-9]+K?$ ]] || die "use: $arg is not a quant (Q4_K_M, Q4_0 or Q3_K_M), a context, or metal or cpu"
                 ctx=$(( 10#${up%K} ))
                 if [ "${up%K}" != "$up" ]; then ctx=$(( ctx * 1024 )); fi
                 if [ "$ctx" -lt 2048 ] || [ "$ctx" -gt 262144 ]; then die "use: a context of 2K to 256K, not $arg"; fi
@@ -446,31 +472,38 @@ cmd_use() {
     elif server_healthy; then
         die "something other than ./loop serves port $PORT; stop it first"
     fi
-    local old_quant=${running:-$QUANT} old_ctx=${served_ctx:-${LOOP_CTX:-}}
+    local old_quant=$QUANT old_ctx=${served_ctx:-${LOOP_CTX:-}} old_port=$METAL_PORT
+    if [ -n "$running" ]; then
+        old_quant=${running%% *}
+        case "$running" in *-metal-*) old_port=1 ;; *" "*) old_port=0 ;; esac
+    fi
 
     QUANT=${quant:-$QUANT}
     if [ "$ctx_set" = 1 ]; then LOOP_CTX=$ctx; fi
-    export LOOP_QUANT="$QUANT" LOOP_CTX="${LOOP_CTX:-}"
+    LOOP_METAL_PORT=${port:-$METAL_PORT}
+    export LOOP_QUANT="$QUANT" LOOP_CTX="${LOOP_CTX:-}" LOOP_METAL_PORT
     load_quant "$QUANT"
+    runtime_paths
     fit_warning
     require_setup
 
     cp "$ROOT/.env" "$STATE/env.previous"
     env_set LOOP_QUANT "$QUANT"
     if [ "$ctx_set" = 1 ]; then env_set LOOP_CTX "$ctx"; fi
+    if [ -n "$port" ]; then env_set LOOP_METAL_PORT "$port"; fi
     if [ -n "$SHELL_OVERRIDES" ]; then
         echo "Note: your shell sets$SHELL_OVERRIDES, which wins over .env, so other commands will not see this choice." \
             "Unset it: unset$SHELL_OVERRIDES" >&2
     fi
 
-    if [ "$running" = "$QUANT" ] && [ "$served_ctx" = "$(ctx_default)" ]; then
-        echo "Already serving $QUANT with a $served_ctx-token context. .env keeps it"
+    if [ "$running" = "$QUANT $RUNTIME_ID" ] && [ "$served_ctx" = "$(ctx_default)" ]; then
+        echo "Already serving $QUANT with a $served_ctx-token context, on $RUNTIME_ID. .env keeps it"
         return 0
     fi
     if [ "$was_running" = 1 ]; then cmd_down; fi
     SHELL_QUANT=""
     if ( cmd_up ); then
-        echo "Now serving $QUANT with a $(ctx_default)-token context. .env keeps it, so ./loop uses it from now on"
+        echo "Now serving $QUANT with a $(ctx_default)-token context, on $RUNTIME_ID. .env keeps it, so ./loop uses it from now on"
         echo "pi picks it up when it starts. In a pi that is already open: ./loop detect in another terminal, then /model"
         return 0
     fi
@@ -478,7 +511,7 @@ cmd_use() {
     cp "$STATE/env.previous" "$ROOT/.env"
     if [ "$was_running" = 1 ]; then
         echo "Starting $old_quant again" >&2
-        LOOP_QUANT="$old_quant" LOOP_CTX="$old_ctx" "$ROOT/loop" up >&2 || true
+        LOOP_QUANT="$old_quant" LOOP_CTX="$old_ctx" LOOP_METAL_PORT="$old_port" "$ROOT/loop" up >&2 || true
     fi
     die "$QUANT did not start, so .env is as it was. Its log: $STATE/server.failed.log"
 }
@@ -514,9 +547,29 @@ lists_metal() {
     echo "$devices" | grep -qiE 'metal|mtl'
 }
 
+# The patch's Metal kernels against the CPU's, with test-backend-ops in the server's sandbox: every case must pass on
+# Metal, none may be left to the CPU
+check_metal_kernels() {
+    local out ok
+    if [ "$METAL_PORT" = 0 ]; then
+        echo "  note  the mHC routing runs on the CPU, in a build without the Metal patch. ./loop use metal switches"
+        return
+    fi
+    server_sandbox "$LLAMA_TESTS"
+    out=$("${SERVER_SANDBOX[@]}" "$LLAMA_TESTS" test -b MTL0 -o MHC_ROUTE,MHC_MERGE 2>&1) || true
+    ok=$(printf '%s\n' "$out" | grep -cE 'MHC_(ROUTE|MERGE)\(.*OK' || true)
+    expect_ok "the Metal routing kernels match the CPU's ($ok of 16 cases)" \
+        sh -c '[ "$1" = 16 ] && ! printf "%s\n" "$2" | grep -qE "FAIL|not supported"' _ "$ok" "$out"
+    if [ "$ok" != 16 ]; then
+        echo "        test-backend-ops says:"
+        printf '%s\n' "$out" | grep -E 'MHC_|FAIL|rror|supported' | tail -n 12 | sed 's/^/        /' || true
+        echo "        ./loop use cpu switches to a build without the patch, with the routing on the CPU"
+    fi
+    server_sandbox
+}
+
 # The server's last start, from its log. llama-server warns when it finds no GPU and falls back to the CPU. At its
-# default log level, it does not say where the layers went, so that line is only there with -lv 4. The fork's two mHC
-# routing operations have no Metal code, so llama.cpp runs them on the CPU whatever the log says: that is expected.
+# default log level, it does not say where the layers went, so that line is only there with -lv 4.
 check_server_log() {
     local line n on total splits
     if [ ! -s "$LOG_FILE" ]; then
@@ -525,7 +578,7 @@ check_server_log() {
     fi
     expect_refused "the server's last start found a GPU" grep -q 'no usable GPU' "$LOG_FILE"
     splits=$(grep -oE 'graph splits = [0-9]+' "$LOG_FILE" | tail -n 1 || true)
-    echo "  note  the mHC routing runs on the CPU, as the fork has no Metal code for it${splits:+ ($splits)}"
+    if [ -n "$splits" ]; then echo "  note  $splits: each is a hop between the GPU and the CPU"; fi
     line=$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' "$LOG_FILE" | tail -n 1 || true)
     if [ -z "$line" ]; then
         echo "  skip  server log: it does not say where the layers went. Watch % GPU in Activity Monitor instead"
@@ -557,6 +610,7 @@ cmd_doctor() {
         "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" --list-devices 2>&1 | tail -n 15 | sed 's/^/        /' || true
     fi
     expect_refused "it cannot start a shell" "${SERVER_SANDBOX[@]}" /bin/sh -c true
+    check_metal_kernels
     check_server_log
 
     echo "Agent sandbox (network: $NETWORK)"
@@ -780,7 +834,7 @@ cmd_bench() {
         IFS=$'\t' read -r n pps first gps gen_n <<<"$row"
         printf '  %-8s %-16s %-13s %s\n' "$n" "$pps tokens/s" "$first s" "$gps tokens/s ($gen_n tokens)"
         jq -c --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg served "$SERVED" --argjson ctx "$SERVED_CTX" \
-            --arg runtime "${LLAMA_COMMIT:0:12}" --argjson machine "$machine" \
+            --arg runtime "$RUNTIME_ID" --argjson machine "$machine" \
             '{date: $date, model: $served, ctx: $ctx, runtime: $runtime} + $machine + (.timings | {
                 prompt_tokens: .prompt_n, prefill_tps: .prompt_per_second, first_token_ms: .prompt_ms,
                 generated_tokens: .predicted_n, generation_tps: .predicted_per_second})' <<<"$RESP" >> "$STATE/bench.jsonl"
@@ -794,8 +848,8 @@ Usage: ./loop [command]
   pi        set up if needed, start the server, open pi (the default); arguments go to pi
   setup     check the tools, build llama.cpp's SenseNova Loop fork, download the model and pi
   models    list the quants, and which is downloaded, selected and running
-  use       switch the server, and keep the choice: ./loop use Q4_0, or a context (32K or auto), or both. Downloads
-            what is missing, and brings the old server back if the new one fails
+  use       switch the server, and keep the choice: ./loop use Q4_0, a context (32K or auto), or cpu or metal for
+            the routing. Builds and downloads what is missing, and brings the old server back if the new one fails
   up        start the server in the background and wait until it is ready
   down      stop the server
   restart   down, then up

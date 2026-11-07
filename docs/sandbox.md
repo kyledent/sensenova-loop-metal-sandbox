@@ -5,7 +5,8 @@ the server. The profiles deny everything by default, and list what is allowed. E
 environment, so your shell's variables do not reach them.
 
 Run `./loop doctor` to test the server's and the agent's on your Mac. It checks that each thing that should work does,
-and that each thing that should be refused is. The build's is tested by the build itself, once.
+and that each thing that should be refused is, and it runs the Metal kernels' checks in the server's sandbox. The
+build's sandbox is tested by the build itself, once.
 
 ## What each one can do
 
@@ -61,8 +62,9 @@ LOOP_AGENT_NETWORK=open ./loop
 one.
 
 - **The runtime** is the fork's source at a pinned commit. git checks that the checkout is that commit, whose hash covers
-  every file in it, then the build runs in its sandbox. If the build's sandbox refuses something the compiler needs on
-  your Mac, `LOOP_BUILD_SANDBOX=0 ./loop setup` builds without it.
+  every file in it, then applies this repository's [Metal patch](metal.md), and the build runs in its sandbox. If the
+  build's sandbox refuses something the compiler needs on your Mac, `LOOP_BUILD_SANDBOX=0 ./loop setup` builds without
+  it.
 - **The model** is pinned to a commit of its Hugging Face repository, and verified against a SHA-256 checksum in the `loop`
   script.
 - **pi** is pinned to a version, and installed by npm with install scripts turned off. Its dependencies are not

@@ -8,8 +8,8 @@ for one run:
 LOOP_CTX=65536 ./loop restart
 ```
 
-After changing a server setting, run `./loop restart`. For the quant and the context, `./loop use` edits `.env` and
-restarts the server for you: see [Switching](model.md#switching).
+After changing a server setting, run `./loop restart`. For the quant, the context and the Metal kernels, `./loop use`
+edits `.env` and restarts the server for you: see [Switching](model.md#switching).
 
 ## Model and server
 
@@ -26,6 +26,7 @@ restarts the server for you: see [Switching](model.md#switching).
 | `LOOP_START_TIMEOUT` | `300` | Seconds to wait for the server to load |
 | `LOOP_CHECK_TIMEOUT` | `900` | Seconds to wait for each request of `./loop check` and `bench` |
 | `LOOP_BUILD_SANDBOX` | `1` | `0` builds llama.cpp without the build's sandbox. See [Sandbox](sandbox.md#what-gets-downloaded) |
+| `LOOP_METAL_PORT` | `1` | `1` builds llama.cpp with the Metal kernels for the model's routing, `0` without, with the routing on the CPU. `./loop use metal` and `./loop use cpu` set it. See [Metal](metal.md) |
 
 The context by RAM follows the tiers of Prism ML's Bonsai-demo: 8K up to 11 GB, 16K up to 23 GB, 32K up to 35 GB, 64K up
 to 71 GB, and 128K above that.
@@ -51,7 +52,7 @@ Nothing below is committed. All of it is listed in `.gitignore`.
 | `.env` | Your settings, which may include tokens |
 | `models/` | The GGUF files |
 | `.runtime/llama-src/` | The fork's source at the pinned commit, and its build |
-| `.runtime/llama/` | The built llama-server |
+| `.runtime/llama/` | The built llama-server and test-backend-ops, in a folder for each commit and version of the Metal patch |
 | `.runtime/pi/` | pi |
 | `.state/api-key` | The server's generated API key |
 | `.state/home/` | The agent's home: pi's settings, sessions and whatever it installs |
@@ -62,4 +63,5 @@ Nothing below is committed. All of it is listed in `.gitignore`.
 | `workspace/` | Your projects |
 
 To start again, stop the server and delete `.state`. To change the runtime, change `LLAMA_COMMIT` at the top of `loop`,
-and run `./loop setup`, which builds the new commit in a folder of its own.
+and run `./loop setup`, which builds the new commit in a folder of its own. A new commit may need a new version of the
+Metal patch, in `patches/`; if it does not apply, setup says so, and `./loop use cpu` builds without it.

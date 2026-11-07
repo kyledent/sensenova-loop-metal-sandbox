@@ -24,12 +24,14 @@ Other GGUF conversions exist, but they were made with other builds, and this for
 ./loop use 32K         # a 32K context, on the same quant
 ./loop use Q3_K_M 16K  # both
 ./loop use auto        # back to the context by RAM
+./loop use cpu         # the build without the Metal patch, with the routing on the CPU
+./loop use metal       # the build with it (the default)
 ```
 
-`use` takes a quant, a context, or both, in either order, and keeps the other as it is. It:
+`use` takes a quant, a context, and `cpu` or `metal`, in any order, and keeps the rest as it is. It:
 
 1. warns if the setup looks too big for the Mac's memory;
-2. downloads what is missing, while the running server keeps serving;
+2. builds and downloads what is missing, while the running server keeps serving;
 3. writes the choice to `.env`, so `./loop` and every other command use it from then on;
 4. restarts the server with it. If the new server does not start, `.env` and the previous server come back, and the
    failed server's log is kept in `.state/server.failed.log`.
@@ -81,9 +83,9 @@ GB, so even `Q3_K_M` at 8K is tight there.
 
 ## What is not known yet
 
-- **Speed on a Mac.** The fork's author measured 30 tokens/s of generation on an AMD RX 5700 XT, with Vulkan. On a Mac, part
-  of each token runs on the CPU (see [Metal](metal.md)), so expect less than the model's size alone suggests.
-  `./loop bench` measures your Mac.
+- **Speed on a Mac.** The fork's author measured 30 tokens/s of generation on an AMD RX 5700 XT, with Vulkan. Each token
+  goes through 56 layers for 32 stored, so expect less than a 9B model's size alone suggests. `./loop bench` measures
+  your Mac, with the [Metal kernels](metal.md) or without them.
 - **Long contexts.** The model was trained up to 262K. The fork's author tested to 16K.
 - **Accuracy of the fork.** Its greedy output matches the reference implementation token for token on one short prompt.
   No perplexity or KL comparison has been run on these quants.

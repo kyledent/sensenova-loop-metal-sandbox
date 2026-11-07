@@ -39,9 +39,10 @@ downloads the model and the runtime's source from their publishers, and does not
   [GuideboardLabs/llama.cpp-sensenova-loop](https://github.com/GuideboardLabs/llama.cpp-sensenova-loop): two commits on
   llama.cpp, with no releases, so `./loop setup` builds it from a pinned commit. Read
   [Hardening](docs/hardening.md#protect-the-supply-chain) on what that means.
-- **Part of each token runs on the CPU.** The fork's two routing operations have CPU and Vulkan code, but no Metal code.
-  llama.cpp runs everything else on the GPU and hands those to the CPU, many times per token. It works, but it is slower
-  than it could be, by an amount not yet measured. See [Metal](docs/metal.md).
+- **This repository adds the Metal kernels the fork lacks.** The fork's two routing operations have CPU and Vulkan code
+  only, so on a Mac llama.cpp would hand them to the CPU about a hundred times per token. `./loop setup` applies a patch
+  with Metal kernels for both, checked against the fork's CPU code, and `./loop doctor` compares them on your GPU.
+  `./loop use cpu` builds without it. See [Metal](docs/metal.md).
 - **The model is a preview.** Its author validated the fork against the reference implementation on one prompt, up to a
   16K context.
 
@@ -83,7 +84,7 @@ work there.
 | `./loop` | Set up if needed, start the server, open pi. Arguments go to pi. |
 | `./loop setup` | Check the tools, build the runtime, and download the selected quant and pi |
 | `./loop models` | List the quants, and which are downloaded and running |
-| `./loop use Q4_0` | Switch the quant or the context, and keep the choice. Brings the old server back if the new one fails |
+| `./loop use Q4_0` | Switch the quant, the context, or `cpu` or `metal` for the routing, and keep the choice. Brings the old server back if the new one fails |
 | `./loop up` / `down` / `restart` | Start or stop the server |
 | `./loop status` / `logs` | See what is running, and follow the server's log |
 | `./loop detect` | List the servers that the agent can see |
@@ -95,7 +96,7 @@ work there.
 ## Documentation
 
 - [Model](docs/model.md): the quants, memory, and what is not known yet
-- [Metal](docs/metal.md): what runs on the CPU, and how to measure it
+- [Metal](docs/metal.md): the Metal kernels for the model's routing, how they were checked, and how to measure them
 - [Configuration](docs/configuration.md): every setting in `.env`
 - [pi integration](docs/pi-integration.md): model detection, thinking levels and auto-compaction
 - [Sandbox](docs/sandbox.md): what each sandbox allows, and its limits
@@ -107,7 +108,8 @@ work there.
 
 `tests/run.sh` runs `./loop`, detection and the pi extension with a mock server and the real pi, on any machine with
 bash, curl, jq, node and python. It stubs macOS's tools, git and cmake, so only `./loop setup` tests the build, and only
-`./loop doctor` the sandboxes.
+`./loop doctor` the sandboxes and the Metal kernels on a GPU. With a C++20 compiler, it also runs the Metal kernels on
+the CPU against the fork's CPU code (`tests/metal-kernels.sh`).
 
 ```sh
 npm install --prefix /tmp/pi @mariozechner/pi-coding-agent@0.73.1
@@ -117,11 +119,13 @@ tests/run.sh /tmp/pi/node_modules/@mariozechner/pi-coding-agent/dist/cli.js
 ## Acknowledgements
 
 SenseNova Loop is by [SenseNova](https://huggingface.co/sensenova), under Apache 2.0. The llama.cpp fork and the GGUF files
-are by [GuideboardLabs](https://github.com/GuideboardLabs). This repository started from
+are by [GuideboardLabs](https://github.com/GuideboardLabs). The Metal patch is this repository's, under the same MIT
+license as llama.cpp, so that it can go upstream. This repository started from
 [bonsai-metal-sandbox](https://github.com/kyledent/bonsai-metal-sandbox), which does the same for Prism ML's Ternary
 Bonsai 2.
 
 ## License
 
-[Apache License 2.0](LICENSE). This covers the code in this repository. The model, the runtime and pi are downloaded from
-their publishers, under their own licenses.
+[Apache License 2.0](LICENSE). This covers the code in this repository, except `patches/`, which changes llama.cpp and
+is under llama.cpp's MIT license. The model, the runtime and pi are downloaded from their publishers, under their own
+licenses.

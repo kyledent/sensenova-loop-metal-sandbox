@@ -240,6 +240,8 @@ built from a pinned commit, but pi's dependencies are not.
   whatever it likes into the server binary, which the server's sandbox then contains. Its two commits are on
   [GitHub](https://github.com/GuideboardLabs/llama.cpp-sensenova-loop/commits/sensenova-loop), as patches in
   `sensenova/patches/`. Moving to upstream llama.cpp once it supports the architecture would remove this risk.
+- **The Metal patch is this repository's code,** in [`patches/`](../patches), applied to the fork before the build. It
+  only adds kernels, their dispatch, and test cases. Read it as you would the fork's commits.
 - **Lock pi's dependencies.** Commit a `package-lock.json`, and install it with `npm ci --ignore-scripts`, so a new release of
   a dependency cannot arrive unnoticed.
 - **Move off the deprecated package.** npm marks `@mariozechner/pi-coding-agent` as deprecated, in favor of
