@@ -1,20 +1,26 @@
 # Model
 
-[SenseNova Loop 9B Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview), as text-only GGUF files from the
-runtime fork's author, [guideboardlabs/SenseNova-Loop-9B-Preview-GGUF](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-Preview-GGUF).
-Each file is pinned to a commit of that repository and to its SHA-256 checksum.
+[SenseNova Loop 9B Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview), as text-only GGUF files. Three
+are from the runtime fork's author, [guideboardlabs/SenseNova-Loop-9B-Preview-GGUF](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-Preview-GGUF),
+and one, which keeps the model's MTP head, from
+[lavendercomputing/SenseNova-Loop-9B-Preview-GSQ-RCO-GGUF](https://huggingface.co/lavendercomputing/SenseNova-Loop-9B-Preview-GSQ-RCO-GGUF).
+Each file is pinned to a commit of its repository and to its SHA-256 checksum.
 
-| | `Q4_K_M` | `Q4_0` | `Q3_K_M` |
-|---|---|---|---|
-| **Weights** | 5.63 GB | 5.33 GB | 4.64 GB |
-| **Model id in pi** | `sensenova-loop-9b-q4-k-m` | `sensenova-loop-9b-q4-0` | `sensenova-loop-9b-q3-k-m` |
-| **Default on** | more than 11 GB | | 11 GB or less |
+| | `Q4_K_M` | `Q4_0` | `Q3_K_M` | `IQ3_M` |
+|---|---|---|---|---|
+| **Weights** | 5.63 GB | 5.33 GB | 4.64 GB | 5.08 GB |
+| **Inside** | Q4_K, Q6_K | Q4_0 | Q3_K and up | IQ3_XXS, with an importance matrix |
+| **MTP head** | No | No | No | Yes: see [MTP](#mtp) |
+| **Model id in pi** | `sensenova-loop-9b-q4-k-m` | `sensenova-loop-9b-q4-0` | `sensenova-loop-9b-q3-k-m` | `sensenova-loop-9b-iq3-m` |
+| **Default on** | more than 11 GB | | 11 GB or less | |
 
-The convolution kernels, norms and routers stay in FP32 in all three. The looped block is stored once, and the runtime
-reuses it for the second pass, so the files are 36% smaller than storing it twice. Vision and the MTP draft head are not
-in these files, so this setup is text only, without speculative decoding.
+The convolution kernels, norms and routers stay in FP32 in all four. The looped block is stored once, and the runtime
+reuses it for the second pass, so the files are 36% smaller than storing it twice. Vision is not in these files, so
+this setup is text only.
 
-Other GGUF conversions exist, but they were made with other builds, and this fork may not load them. Use these.
+`IQ3_M` is named by its repository's size target, but its weights are IQ3_XXS, about 3.1 bits each, close to `Q3_K_M`.
+That repository's `IQ3_S` and `IQ3_XS` are mostly IQ2_S inside, which is why only `IQ3_M` is offered here. Other
+conversions exist, but they were made with other builds, and this fork may not load them.
 
 ## Switching
 
@@ -26,6 +32,8 @@ Other GGUF conversions exist, but they were made with other builds, and this for
 ./loop use auto        # back to the context by RAM
 ./loop use cpu         # the build without the Metal patch, with the routing on the CPU
 ./loop use metal       # the build with it (the default)
+./loop use mtp         # IQ3_M, with MTP speculative decoding
+./loop use nomtp       # the same file, without it
 ```
 
 To choose the context from a list, with the memory that each size needs for the selected quant, run `./loop ctx`:
@@ -59,6 +67,31 @@ your shell sets one.
 
 The next time pi starts, detection finds the new model and makes it the default. In a pi that is already open, run
 `./loop detect` in another terminal, then pick the model in `/model`.
+
+## MTP
+
+The model has a multi-token prediction (MTP) head: one extra decoder block that guesses the next token from the last
+hidden state. With `--spec-type draft-mtp`, llama.cpp lets the head draft a token, then has the model check it in the
+same pass as the next one. Each accepted draft is a token for the price of a small extra block, and a rejected one
+costs that block and nothing else, so the output is the same as without it.
+
+```sh
+./loop use mtp       # switch to IQ3_M, with MTP drafting
+./loop bench         # generation speed, and how many drafts were accepted
+./loop use nomtp     # the same file without drafting, to compare
+./loop use Q3_K_M    # back to the fork author's file
+```
+
+What is not known yet:
+
+- **Whether it works on this model.** The fork has the code for it, the MTP draft graph of Qwen3.5, and its loader
+  expects the head at block 56, where this file has it. But the fork's author ships no file with the head, so nobody has
+  reported running it. If the server will not start with it, or `./loop check` fails, `./loop use nomtp` turns it off.
+- **How much faster it is.** That depends on how often the drafts are accepted, which `./loop bench` reports. Its prompts
+  repeat one sentence, which is easy to predict, so expect a lower rate on real work.
+- **The file's provenance.** It is a community conversion, from a different converter than the other three, with a
+  quantization of its own. Its metadata matches the fork's format exactly, and the server's sandbox contains it like any
+  other model file.
 
 ## Settings from the model card
 
@@ -101,6 +134,7 @@ GB, so even `Q3_K_M` at 8K is tight there.
 
 ## What is not known yet
 
+- **Whether MTP works, and how much it helps.** See [MTP](#mtp).
 - **Speed on a Mac.** The fork's author measured 30 tokens/s of generation on an AMD RX 5700 XT, with Vulkan. Each token
   goes through 56 layers for 32 stored, so expect less than a 9B model's size alone suggests. `./loop bench` measures
   your Mac, with the [Metal kernels](metal.md) or without them.

@@ -22,10 +22,9 @@ LLAMA_SRC="$RUNTIME/llama-src"
 # Metal kernels for the fork's two routing ops, which it has for the CPU and Vulkan only. See docs/metal.md.
 METAL_PATCH="$ROOT/patches/0001-metal-mhc-route-and-merge.patch"
 
-# The fork author's GGUFs, made with its converter: text only, the looped block stored once
-HF_REPO=guideboardlabs/SenseNova-Loop-9B-Preview-GGUF
-HF_REVISION=7e9e0cf5b77d2fa9ccbca4091c411b47286d0afe
-QUANTS="Q4_K_M Q4_0 Q3_K_M"
+# The quants: the fork author's GGUFs, made with its converter, text only. And one from lavendercomputing that keeps the
+# model's MTP head (block 56), in the same format, for speculative decoding: the only GGUF that has it.
+QUANTS="Q4_K_M Q4_0 Q3_K_M IQ3_M"
 MODEL_MARKER="$STATE/server.model"
 
 PI_PACKAGE=@mariozechner/pi-coding-agent
@@ -45,16 +44,35 @@ load_env() {
     done < "$ROOT/.env"
 }
 
-# A quant, pinned by the repository's commit and the file's checksum. Sets the variables that name its file.
+# A quant, pinned by its repository's commit and the file's checksum. Sets the variables that name its file and where
+# it comes from, and HAS_MTP when the file holds the MTP head.
 load_quant() {
+    HF_REPO=guideboardlabs/SenseNova-Loop-9B-Preview-GGUF
+    HF_REVISION=7e9e0cf5b77d2fa9ccbca4091c411b47286d0afe
     MODEL_FILE="SenseNova-Loop-9B-Preview-$1.gguf"
+    MODEL_PATH=$MODEL_FILE
+    HAS_MTP=0
     case "$1" in
         Q4_K_M) MODEL_SHA256=521696d7e148c71773826e41d3c5f12b4a5d25278dcbecf93a21d9848d7624a2; MODEL_SIZE=5628723360 ;;
         Q4_0)   MODEL_SHA256=753998a3e0071c153d1b9528bce9040bbeb2dcece531b39748fe089fd4fb28e0; MODEL_SIZE=5325947040 ;;
         Q3_K_M) MODEL_SHA256=02fa9b5c21ca4c60a8fac3fcbcfccbf2c87d5c6928be98de2666234cc251ba9e; MODEL_SIZE=4642406560 ;;
-        *) die "LOOP_QUANT must be Q4_K_M, Q4_0 or Q3_K_M, not $1" ;;
+        IQ3_M)
+            # IQ3_XXS weights with an imatrix, the MTP block included
+            HF_REPO=lavendercomputing/SenseNova-Loop-9B-Preview-GSQ-RCO-GGUF
+            HF_REVISION=9e69cbc6f541e0a84c1d09ed640f252e1544dcde
+            MODEL_FILE="SenseNova-Loop-9B-Preview-GSQ-RCO-IQ3_M.gguf"
+            MODEL_PATH="quant/$MODEL_FILE"
+            HAS_MTP=1
+            MODEL_SHA256=fae1ce19cd2410306d128554cda7ab9fd27c25426afe2085ec35e3e809274392; MODEL_SIZE=5075013152 ;;
+        *) die "LOOP_QUANT must be Q4_K_M, Q4_0, Q3_K_M or IQ3_M, not $1" ;;
     esac
 }
+
+# MTP speculative decoding: on when the quant has the head, unless LOOP_MTP=0
+mtp_on() { [ "$HAS_MTP" = 1 ] && [ "${LOOP_MTP:-1}" != 0 ]; }
+
+# What the server runs, as its marker records it: the quant, the build, and whether MTP drafts
+serve_id() { echo "$QUANT $RUNTIME_ID $(mtp_on && echo mtp || echo nomtp)"; }
 
 # The server lets any web page call it (CORS allows every origin), so it always has a key: LOOP_API_KEY, or one
 # generated once and kept in .state, which the agent's sandbox cannot read. The agent gets it in its environment.
@@ -85,7 +103,7 @@ load_config() {
     local key
     SHELL_QUANT=$(echo "${LOOP_QUANT:-}" | tr 'a-z' 'A-Z')   # asked for on this command line, unlike one in .env
     SHELL_OVERRIDES=""   # what the shell sets, which wins over what ./loop use writes to .env
-    for key in LOOP_QUANT LOOP_CTX LOOP_METAL_PORT; do
+    for key in LOOP_QUANT LOOP_CTX LOOP_METAL_PORT LOOP_MTP; do
         [ -z "${!key+x}" ] || SHELL_OVERRIDES="$SHELL_OVERRIDES $key"
     done
     load_env
@@ -236,7 +254,7 @@ cmd_setup() {
 
     if [ ! -x "$LLAMA_SERVER" ]; then build_llama; fi
 
-    download "https://huggingface.co/$HF_REPO/resolve/$HF_REVISION/$MODEL_FILE" \
+    download "https://huggingface.co/$HF_REPO/resolve/$HF_REVISION/$MODEL_PATH" \
         "$MODEL_DIR/$MODEL_FILE" "$MODEL_SHA256" "$MODEL_SIZE"
 
     # Install scripts would run outside the sandbox, so they are not run
@@ -300,8 +318,11 @@ server_wants_key() {
 cmd_up() {
     require_setup
     if server_pid >/dev/null; then
-        local running wanted="$QUANT $RUNTIME_ID"
+        local running wanted
+        wanted=$(serve_id)
         running=$(cat "$MODEL_MARKER" 2>/dev/null || echo unknown)
+        # A marker from before MTP has the quant and the build only
+        case "$running" in *" "*" "*) ;; *" "*) running="$running nomtp" ;; esac
         if [ "$running" = "$wanted" ]; then
             echo "Server already running on port $PORT"
         elif [ -n "$SHELL_QUANT" ]; then
@@ -321,14 +342,16 @@ cmd_up() {
             $(sampling_args)
             --jinja --reasoning-format deepseek --reasoning-budget "$(reasoning_budget_default)"
             --parallel 1 --cache-ram "$(cache_ram_default)" --no-webui)
+        # The model's own MTP head drafts the next token, and the model checks it in the same pass as the one before
+        if mtp_on; then args+=(--spec-type draft-mtp); fi
         # shellcheck disable=SC2206  # split into words on purpose
         args+=(${LOOP_SERVER_ARGS:-})
         server_sandbox
         # From its own folder: ggml lists the current one for backends, and the sandbox refuses this repository's
         ( cd "$LLAMA_DIR" && exec nohup "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1 < /dev/null ) &
         echo $! > "$PID_FILE"
-        echo "$QUANT $RUNTIME_ID" > "$MODEL_MARKER"
-        echo "Starting the $QUANT server on port $PORT (log: $LOG_FILE)"
+        serve_id > "$MODEL_MARKER"
+        echo "Starting the $QUANT server$(mtp_on && echo ", with MTP,") on port $PORT (log: $LOG_FILE)"
     fi
     local waited=0 limit="${LOOP_START_TIMEOUT:-300}"
     until server_healthy; do
@@ -400,7 +423,7 @@ agent_run() {
 cmd_models() {
     local q state running=""
     if server_pid >/dev/null; then running=$(cat "$MODEL_MARKER" 2>/dev/null || true); fi
-    echo "SenseNova Loop 9B Preview, from $HF_REPO"
+    echo "SenseNova Loop 9B Preview"
     printf '  %-8s %-9s %s\n' QUANT WEIGHTS FILE
     for q in $QUANTS; do
         load_quant "$q"
@@ -408,12 +431,14 @@ cmd_models() {
         if [ -f "$MODEL_DIR/$MODEL_FILE" ]; then state=downloaded; fi
         if [ "$q" = "$QUANT" ]; then state="$state, selected"; fi
         if [ "$q" = "${running%% *}" ]; then state="$state, running"; fi
+        if [ "$HAS_MTP" = 1 ]; then state="$state; has the MTP head"; fi
         printf '  %-8s %-9s %s (%s)\n' "$q" "$(( MODEL_SIZE / 1000000 )) MB" "$MODEL_FILE" "$state"
     done
     load_quant "$QUANT"
     echo
     echo "Build: $RUNTIME_ID, with the routing on $([ "$METAL_PORT" = 0 ] && echo the CPU || echo Metal)"
-    echo "To switch: ./loop use Q4_0, or a context (32K, or auto), or cpu or metal for the routing, in any combination"
+    if [ "$HAS_MTP" = 1 ]; then echo "MTP: $(mtp_on && echo on || echo off, with ./loop use nomtp)"; fi
+    echo "To switch: ./loop use Q4_0, a context (32K, or auto), cpu or metal for the routing, or mtp, in any combination"
 }
 
 # Sets KEY=VALUE in .env, in place of the first KEY= line, or at the end
@@ -452,17 +477,20 @@ fit_warning() {
 # does not start, .env and the previous server come back. metal and cpu choose the build with or without the Metal
 # patch, which runs the model's routing on the GPU or the CPU.
 cmd_use() {
-    local arg up quant="" ctx="" ctx_set=0 port=""
-    [ $# -gt 0 ] || die "use: name a quant (Q4_K_M, Q4_0 or Q3_K_M), a context (32K, or auto), or metal or cpu"
+    local arg up quant="" ctx="" ctx_set=0 port="" mtp=""
+    [ $# -gt 0 ] || die "use: name a quant (Q4_K_M, Q4_0, Q3_K_M or IQ3_M), a context (32K, or auto), metal or cpu, or mtp or nomtp"
     for arg in "$@"; do
         up=$(echo "$arg" | tr 'a-z' 'A-Z')
         case "$up" in
             Q4_K_M|Q4KM|Q4_0|Q3_K_M|Q3KM) quant=$(echo "$up" | sed 's/^Q\([0-9]\)KM$/Q\1_K_M/') ;;
+            IQ3_M|IQ3M) quant=IQ3_M ;;
+            MTP) quant=${quant:-IQ3_M}; mtp=1 ;;
+            NOMTP) mtp=0 ;;
             AUTO) ctx=""; ctx_set=1 ;;
             METAL) port=1 ;;
             CPU|NOMETAL) port=0 ;;
             *)
-                [[ $up =~ ^[0-9]+K?$ ]] || die "use: $arg is not a quant (Q4_K_M, Q4_0 or Q3_K_M), a context, or metal or cpu"
+                [[ $up =~ ^[0-9]+K?$ ]] || die "use: $arg is not a quant, a context, metal or cpu, or mtp or nomtp"
                 ctx=$(( 10#${up%K} ))
                 if [ "${up%K}" != "$up" ]; then ctx=$(( ctx * 1024 )); fi
                 if [ "$ctx" -lt 2048 ] || [ "$ctx" -gt 262144 ]; then die "use: a context of 2K to 256K, not $arg"; fi
@@ -480,17 +508,20 @@ cmd_use() {
     elif server_healthy; then
         die "something other than ./loop serves port $PORT; stop it first"
     fi
-    local old_quant=$QUANT old_ctx=${served_ctx:-${LOOP_CTX:-}} old_port=$METAL_PORT
+    local old_quant=$QUANT old_ctx=${served_ctx:-${LOOP_CTX:-}} old_port=$METAL_PORT old_mtp=${LOOP_MTP:-1}
     if [ -n "$running" ]; then
         old_quant=${running%% *}
         case "$running" in *-metal-*) old_port=1 ;; *" "*) old_port=0 ;; esac
+        case "$running" in *" nomtp") old_mtp=0 ;; *" mtp") old_mtp=1 ;; esac
     fi
 
     QUANT=${quant:-$QUANT}
     if [ "$ctx_set" = 1 ]; then LOOP_CTX=$ctx; fi
     LOOP_METAL_PORT=${port:-$METAL_PORT}
-    export LOOP_QUANT="$QUANT" LOOP_CTX="${LOOP_CTX:-}" LOOP_METAL_PORT
+    LOOP_MTP=${mtp:-${LOOP_MTP:-1}}
+    export LOOP_QUANT="$QUANT" LOOP_CTX="${LOOP_CTX:-}" LOOP_METAL_PORT LOOP_MTP
     load_quant "$QUANT"
+    if [ "$mtp" = 1 ] && [ "$HAS_MTP" != 1 ]; then die "use: $QUANT has no MTP head; IQ3_M has one"; fi
     runtime_paths
     fit_warning
     require_setup
@@ -499,12 +530,13 @@ cmd_use() {
     env_set LOOP_QUANT "$QUANT"
     if [ "$ctx_set" = 1 ]; then env_set LOOP_CTX "$ctx"; fi
     if [ -n "$port" ]; then env_set LOOP_METAL_PORT "$port"; fi
+    if [ -n "$mtp" ]; then env_set LOOP_MTP "$mtp"; fi
     if [ -n "$SHELL_OVERRIDES" ]; then
         echo "Note: your shell sets$SHELL_OVERRIDES, which wins over .env, so other commands will not see this choice." \
             "Unset it: unset$SHELL_OVERRIDES" >&2
     fi
 
-    if [ "$running" = "$QUANT $RUNTIME_ID" ] && [ "$served_ctx" = "$(ctx_default)" ]; then
+    if [ "$running" = "$(serve_id)" ] && [ "$served_ctx" = "$(ctx_default)" ]; then
         echo "Already serving $QUANT with a $served_ctx-token context, on $RUNTIME_ID. .env keeps it"
         return 0
     fi
@@ -519,7 +551,7 @@ cmd_use() {
     cp "$STATE/env.previous" "$ROOT/.env"
     if [ "$was_running" = 1 ]; then
         echo "Starting $old_quant again" >&2
-        LOOP_QUANT="$old_quant" LOOP_CTX="$old_ctx" LOOP_METAL_PORT="$old_port" "$ROOT/loop" up >&2 || true
+        LOOP_QUANT="$old_quant" LOOP_CTX="$old_ctx" LOOP_METAL_PORT="$old_port" LOOP_MTP="$old_mtp" "$ROOT/loop" up >&2 || true
     fi
     die "$QUANT did not start, so .env is as it was. Its log: $STATE/server.failed.log"
 }
@@ -864,7 +896,7 @@ cmd_check() {
 }
 
 cmd_bench() {
-    local sizes=${*:-512 2048 8192} gen=128 size f row machine n pps first gps gen_n
+    local sizes=${*:-512 2048 8192} gen=128 size f row machine n pps first gps gen_n dn da drafts
     for size in $sizes; do case "$size" in *[!0-9]*|'') die "bench takes prompt sizes in tokens, not $size" ;; esac; done
     serving_ready
     f="$CHECK_DIR/prompt.txt"
@@ -885,14 +917,17 @@ cmd_bench() {
         chat "$f" "$gen" false '{"ignore_eos": true}'
         [ "$CODE" = 200 ] || die "the request of $size tokens failed: $(error_text)"
         row=$(jq -r '.timings | [.prompt_n, (.prompt_per_second | round), (.prompt_ms / 100 | round / 10),
-            (.predicted_per_second * 10 | round / 10), .predicted_n] | @tsv' <<<"$RESP")
-        IFS=$'\t' read -r n pps first gps gen_n <<<"$row"
-        printf '  %-8s %-16s %-13s %s\n' "$n" "$pps tokens/s" "$first s" "$gps tokens/s ($gen_n tokens)"
+            (.predicted_per_second * 10 | round / 10), .predicted_n, (.draft_n // 0), (.draft_n_accepted // 0)] | @tsv' <<<"$RESP")
+        IFS=$'\t' read -r n pps first gps gen_n dn da <<<"$row"
+        drafts=""
+        if [ "$dn" -gt 0 ]; then drafts=", $(( da * 100 / dn ))% of $dn drafts accepted"; fi
+        printf '  %-8s %-16s %-13s %s\n' "$n" "$pps tokens/s" "$first s" "$gps tokens/s ($gen_n tokens$drafts)"
         jq -c --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg served "$SERVED" --argjson ctx "$SERVED_CTX" \
-            --arg runtime "$RUNTIME_ID" --argjson machine "$machine" \
-            '{date: $date, model: $served, ctx: $ctx, runtime: $runtime} + $machine + (.timings | {
+            --arg runtime "$RUNTIME_ID" --argjson mtp "$(mtp_on && echo true || echo false)" --argjson machine "$machine" \
+            '{date: $date, model: $served, ctx: $ctx, runtime: $runtime, mtp: $mtp} + $machine + (.timings | {
                 prompt_tokens: .prompt_n, prefill_tps: .prompt_per_second, first_token_ms: .prompt_ms,
-                generated_tokens: .predicted_n, generation_tps: .predicted_per_second})' <<<"$RESP" >> "$STATE/bench.jsonl"
+                generated_tokens: .predicted_n, generation_tps: .predicted_per_second,
+                draft_tokens: .draft_n, drafts_accepted: .draft_n_accepted})' <<<"$RESP" >> "$STATE/bench.jsonl"
     done
     echo "Results added to $STATE/bench.jsonl"
 }
@@ -903,8 +938,9 @@ Usage: ./loop [command]
   pi        set up if needed, start the server, open pi (the default); arguments go to pi
   setup     check the tools, build llama.cpp's SenseNova Loop fork, download the model and pi
   models    list the quants, and which is downloaded, selected and running
-  use       switch the server, and keep the choice: ./loop use Q4_0, a context (32K or auto), or cpu or metal for
-            the routing. Builds and downloads what is missing, and brings the old server back if the new one fails
+  use       switch the server, and keep the choice: ./loop use Q4_0, a context (32K or auto), cpu or metal for the
+            routing, or mtp (IQ3_M, with MTP drafting) or nomtp. Builds and downloads what is missing, and brings the
+            old server back if the new one fails
   ctx       choose the context size from a list, with the memory each needs; or ./loop ctx 32K
   up        start the server in the background and wait until it is ready
   down      stop the server

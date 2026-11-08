@@ -40,7 +40,9 @@ For each prompt size it reports:
 
 - **Prefill:** how fast the server reads the prompt, in tokens per second.
 - **First token:** how long reading it took, which is the wait before an answer starts.
-- **Generation:** how fast it writes, over 128 tokens, with thinking off.
+- **Generation:** how fast it writes, over 128 tokens, with thinking off. With MTP, also how many of the drafted tokens
+  were accepted, which is what decides whether it helps. The prompts repeat one sentence, so this rate is higher than on
+  real work.
 
 Sizes that do not fit the context are skipped. A first, short request is not counted, as it also compiles Metal's
 kernels. Prompts are new each time, so the prompt cache does not help, as in a fresh session.

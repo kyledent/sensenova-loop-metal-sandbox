@@ -16,7 +16,8 @@ edits `.env` and restarts the server for you, and `./loop ctx` lists the context
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `LOOP_QUANT` | by RAM | `Q4_K_M`, `Q4_0` or `Q3_K_M`. Empty: `Q3_K_M` up to 11 GB, `Q4_K_M` above. See [Model](model.md) |
+| `LOOP_QUANT` | by RAM | `Q4_K_M`, `Q4_0`, `Q3_K_M` or `IQ3_M`. Empty: `Q3_K_M` up to 11 GB, `Q4_K_M` above. See [Model](model.md) |
+| `LOOP_MTP` | `1` | With `IQ3_M`, the only quant with the MTP head: `1` drafts with it (`--spec-type draft-mtp`), `0` does not. `./loop use mtp` and `nomtp` set it. See [MTP](model.md#mtp) |
 | `LOOP_MODEL_DIR` | `./models` | Where the GGUF files go |
 | `LOOP_CTX` | by RAM | Context in tokens, up to 262144. About 56 KiB of memory per token, on top of the weights |
 | `LOOP_PORTS` | `8080-8083` | Ports that detection tries and the agent may reach. The server listens on the first, on loopback only |

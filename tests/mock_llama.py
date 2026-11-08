@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--usage-file", default=None, help="prompt tokens to report, read at each request")
     parser.add_argument("--overflow-text", default=OVERFLOW, help="the error for a prompt longer than the context")
     parser.add_argument("--think-tokens", type=int, default=400, help="thinking without a budget")
+    parser.add_argument("--spec-type", default=None, help="speculative decoding, which adds draft counts to timings")
     args, _ = parser.parse_known_args()
     if args.list_devices:
         print("Available devices:\n  MTL0: Apple M4 Pro (mock)")
@@ -111,13 +112,16 @@ def main():
                 message["content"] = "ready now"
             generated = max_tokens if request.get("ignore_eos") else min(max_tokens, used + 2)
             prompt_n = 1 if cached else n
+            timings = {"cache_n": n - prompt_n, "prompt_n": prompt_n, "prompt_ms": prompt_n * 2.0,
+                       "prompt_per_second": 500.0, "predicted_n": generated, "predicted_ms": generated * 50.0,
+                       "predicted_per_second": 20.0}
+            if args.spec_type:  # as the server reports drafts: three of every four accepted
+                timings.update({"draft_n": 100, "draft_n_accepted": 75})
             self.send_json({
                 "id": "mock", "object": "chat.completion", "model": args.alias,
                 "choices": [{"index": 0, "message": message, "finish_reason": finish}],
                 "usage": {"prompt_tokens": n, "completion_tokens": generated, "total_tokens": n + generated},
-                "timings": {"cache_n": n - prompt_n, "prompt_n": prompt_n, "prompt_ms": prompt_n * 2.0,
-                            "prompt_per_second": 500.0, "predicted_n": generated, "predicted_ms": generated * 50.0,
-                            "predicted_per_second": 20.0},
+                "timings": timings,
             })
 
         def stream(self, request):

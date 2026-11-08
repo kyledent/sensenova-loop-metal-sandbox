@@ -21,6 +21,7 @@ hybrid, with three linear-attention layers for each full-attention one.
 | `Q4_K_M` | 5.6 GB | Macs with more than 11 GB |
 | `Q4_0` | 5.3 GB | |
 | `Q3_K_M` | 4.6 GB | Macs with 8 GB |
+| `IQ3_M` | 5.1 GB | With the model's MTP head, for speculative decoding: `./loop use mtp` |
 
 To switch, run `./loop use Q4_0`, which downloads it if needed, restarts the server, and keeps the choice. See
 [Model](docs/model.md).
@@ -84,7 +85,7 @@ work there.
 | `./loop` | Set up if needed, start the server, open pi. Arguments go to pi. |
 | `./loop setup` | Check the tools, build the runtime, and download the selected quant and pi |
 | `./loop models` | List the quants, and which are downloaded and running |
-| `./loop use Q4_0` | Switch the quant, the context, or `cpu` or `metal` for the routing, and keep the choice. Brings the old server back if the new one fails |
+| `./loop use Q4_0` | Switch the quant, the context, `cpu` or `metal` for the routing, or `mtp` or `nomtp`, and keep the choice. Brings the old server back if the new one fails |
 | `./loop ctx` | Choose the context size from a list, with the memory each needs on this Mac |
 | `./loop up` / `down` / `restart` | Start or stop the server |
 | `./loop status` / `logs` | See what is running, and follow the server's log |

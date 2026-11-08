@@ -51,6 +51,14 @@ as narrowly as you can.
 - **M5 on macOS 26.2 to 26.4:** Prism ML found an out-of-memory error in ggml's Metal backend there, with the workaround
   `GGML_METAL_TENSOR_DISABLE=1 ./loop restart`.
 
+## MTP
+
+- **The server stops while loading, with `IQ3_M` and MTP:** the fork has not been run with the MTP head before. Try
+  `./loop use nomtp`. If that loads, MTP is the cause: please report it, with the end of `.state/server.log`.
+- **`./loop check` fails only with MTP:** the same, with `./loop use nomtp` to compare.
+- **It is not faster:** `./loop bench` shows how many drafts are accepted. Below about half, drafting costs more than it
+  saves; `./loop use nomtp`.
+
 ## Empty or cut-off answers
 
 The model thinks before it answers, and the thinking counts against the output limit. On a small context, the limit is

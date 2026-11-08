@@ -301,6 +301,24 @@ check "ctx: auto goes back" sh -c 'echo a | ./loop ctx >/dev/null 2>&1 && grep -
 check "ctx: refuses a choice not in the list" sh -c '! echo 9 | ./loop ctx >/dev/null 2>&1'
 check "ctx: refuses what is not a size" sh -c '! ./loop ctx big >/dev/null 2>&1'
 
+# --- MTP: IQ3_M has the model's MTP head, and the server drafts with it
+: > models/SenseNova-Loop-9B-Preview-GSQ-RCO-IQ3_M.gguf
+check "./loop models: IQ3_M has the MTP head" sh -c './loop models | grep -q "IQ3_M .*GSQ-RCO-IQ3_M.gguf (downloaded; has the MTP head)"'
+check "use: a quant without the head refuses mtp" sh -c '! ./loop use Q4_0 mtp >/dev/null 2>&1'
+: > "$WORK/sandbox.log"
+check "./loop use mtp serves IQ3_M, drafting with MTP" sh -c './loop use mtp >/dev/null'
+check "mtp: .env keeps it" sh -c "grep -q '^LOOP_QUANT=IQ3_M$' .env && grep -q '^LOOP_MTP=1$' .env"
+check "mtp: the server drafts with the model's head" contains "$WORK/sandbox.log" \
+    'exec .*GSQ-RCO-IQ3_M.gguf .*--alias sensenova-loop-9b-iq3-m .*--no-webui --spec-type draft-mtp$'
+check "mtp: bench reports the drafts accepted" sh -c './loop bench 512 | grep -q "75% of 100 drafts accepted"'
+check "mtp: and keeps them" sh -c \
+    "tail -n 1 .state/bench.jsonl | jq -e '.mtp == true and .draft_tokens == 100 and .drafts_accepted == 75' >/dev/null"
+: > "$WORK/sandbox.log"
+check "./loop use nomtp keeps the quant, without drafting" sh -c \
+    './loop use nomtp >/dev/null && grep -q "IQ3_M.gguf" "$0/sandbox.log" && ! grep -q -- --spec-type "$0/sandbox.log" && grep -q "^LOOP_MTP=0$" .env' "$WORK"
+check "./loop use Q4_K_M goes back" sh -c './loop use Q4_K_M >/dev/null && ./loop status | grep -q "ready: sensenova-loop-9b-q4-k-m"'
+check "a server started before MTP is still recognized" sh -c     'm=$(cat .state/server.model) && echo "${m% nomtp}" > .state/server.model && ./loop up | grep -q "^Server already running on port"'
+
 # --- One of ours whose pid file is gone: found by its port
 ORPHAN=$(cat .state/server.pid)
 rm -f .state/server.pid .state/server.model
