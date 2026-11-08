@@ -28,6 +28,24 @@ Other GGUF conversions exist, but they were made with other builds, and this for
 ./loop use metal       # the build with it (the default)
 ```
 
+To choose the context from a list, with the memory that each size needs for the selected quant, run `./loop ctx`:
+
+```
+The server serves Q4_K_M with a 16384-token context.
+The GPU may use about 12 GB of this Mac's 16 GB. Estimated memory for each context:
+  1)    8K  about 5.9 GB
+  2)   16K  about 6.4 GB   (current, default for this Mac)
+  3)   32K  about 7.2 GB
+  4)   64K  about 9.0 GB
+  5)  128K  about 12.5 GB   (too big)
+  6)  256K  about 19.5 GB   (too big)
+  a) auto: by RAM, now 16K
+Choose 1-6 or a, or press Enter to keep it:
+```
+
+Your choice goes through `use`, so it is kept, and the old server comes back if the new one fails. `./loop ctx 32K`
+chooses without the list. The fork's author has tested up to 16K.
+
 `use` takes a quant, a context, and `cpu` or `metal`, in any order, and keeps the rest as it is. It:
 
 1. warns if the setup looks too big for the Mac's memory;

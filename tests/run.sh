@@ -290,6 +290,17 @@ check "./loop use metal goes back" sh -c './loop use metal >/dev/null'
 check "use: the server runs from the patched build" contains "$WORK/sandbox.log" "exec .*/$LLAMA_DIR/llama-server "
 check "use: .env keeps that too" contains .env '^LOOP_METAL_PORT=1$'
 
+# --- The context selector: the sizes with their memory, and a choice read from stdin
+check "./loop ctx lists the sizes, with the current one" sh -c     './loop ctx </dev/null 2>/dev/null | grep -q "^  5)  128K  about .* GB   (current, default for this Mac)$"'
+echo 8589934592 > "$WORK/memsize"
+check "ctx: marks what does not fit" sh -c './loop ctx </dev/null 2>/dev/null | grep -q "^  4)   64K  about .*too big)$"'
+echo 137438953472 > "$WORK/memsize"
+check "ctx: a choice from the list is served and kept" sh -c     'echo 2 | ./loop ctx >/dev/null 2>&1 && grep -q "^LOOP_CTX=16384$" .env && ./loop status | grep -q "ready: sensenova-loop-9b-q4-k-m, ctx 16384"'
+check "ctx: a size on the command line" sh -c './loop ctx 32k >/dev/null 2>&1 && grep -q "^LOOP_CTX=32768$" .env'
+check "ctx: auto goes back" sh -c 'echo a | ./loop ctx >/dev/null 2>&1 && grep -q "^LOOP_CTX=$" .env && ./loop status | grep -q "ctx 131072"'
+check "ctx: refuses a choice not in the list" sh -c '! echo 9 | ./loop ctx >/dev/null 2>&1'
+check "ctx: refuses what is not a size" sh -c '! ./loop ctx big >/dev/null 2>&1'
+
 # --- One of ours whose pid file is gone: found by its port
 ORPHAN=$(cat .state/server.pid)
 rm -f .state/server.pid .state/server.model

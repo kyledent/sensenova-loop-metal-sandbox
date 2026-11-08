@@ -9,7 +9,8 @@ LOOP_CTX=65536 ./loop restart
 ```
 
 After changing a server setting, run `./loop restart`. For the quant, the context and the Metal kernels, `./loop use`
-edits `.env` and restarts the server for you: see [Switching](model.md#switching).
+edits `.env` and restarts the server for you, and `./loop ctx` lists the context sizes to choose from: see
+[Switching](model.md#switching).
 
 ## Model and server
 

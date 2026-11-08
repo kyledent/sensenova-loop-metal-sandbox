@@ -426,13 +426,21 @@ env_set() {
     mv "$tmp" "$ROOT/.env"
 }
 
-# Weights and the context's KV cache at 56 KiB per token, plus 256 MiB for the linear-attention state and the compute
-# buffers, against the three quarters or so of the RAM that macOS lets the GPU use. A rough guide.
+# The memory a context needs, in MiB: the weights, the context's KV cache at 56 KiB per token, and 256 MiB for the
+# linear-attention state and the compute buffers. A rough guide.
+mem_need_mib() {
+    echo $(( (MODEL_SIZE + $1 * 57344) / 1048576 + 256 ))
+}
+
+# What macOS lets the GPU use, roughly: three quarters of the RAM
+gpu_mib() { echo $(( $(mem_gb) * 1024 * 3 / 4 )); }
+
+# The selected setup's memory against what the GPU may use
 fit_warning() {
     local ctx need have
     ctx=$(ctx_default)
-    need=$(( (MODEL_SIZE + ctx * 57344) / 1048576 + 256 ))
-    have=$(( $(mem_gb) * 1024 * 3 / 4 ))
+    need=$(mem_need_mib "$ctx")
+    have=$(gpu_mib)
     if [ "$need" -gt "$have" ]; then
         echo "Warning: $QUANT with a $ctx-token context needs about $(( need / 1024 + 1 )) GB, more than the" \
             "$(( have / 1024 )) GB or so that the GPU may use on this Mac. A smaller context or quant would fit better" >&2
@@ -514,6 +522,53 @@ cmd_use() {
         LOOP_QUANT="$old_quant" LOOP_CTX="$old_ctx" LOOP_METAL_PORT="$old_port" "$ROOT/loop" up >&2 || true
     fi
     die "$QUANT did not start, so .env is as it was. Its log: $STATE/server.failed.log"
+}
+
+CTX_SIZES="8192 16384 32768 65536 131072 262144"
+
+# ./loop ctx: each context size, with the memory it needs for the selected quant, and a choice of one, which use then
+# serves and keeps in .env. ./loop ctx 32K, or auto, chooses without the list. The choice is read from the terminal,
+# or from stdin: "echo 2 | ./loop ctx" picks the second size.
+cmd_ctx() {
+    local c i=0 n current by_ram have need note ans choice
+    if [ $# -gt 0 ]; then
+        case "$(echo "$1" | tr 'a-z' 'A-Z')" in AUTO|[0-9]*) cmd_use "$1"; return ;; esac
+        die "ctx: a context size (32K, 32768) or auto, not $1"
+    fi
+    by_ram=$(LOOP_CTX='' ctx_default)
+    current=$(ctx_default)
+    if server_healthy; then
+        n=$(curl -fsS -m 3 -H "Authorization: Bearer $LOOP_API_KEY" "$BASE_URL/props" 2>/dev/null \
+            | jq -r '.default_generation_settings.n_ctx // empty' 2>/dev/null || true)
+        if [ -n "$n" ]; then current=$n; fi
+        echo "The server serves $QUANT with a $current-token context."
+    else
+        echo "$QUANT is selected, with a $current-token context. The server is not running."
+    fi
+    have=$(gpu_mib)
+    echo "The GPU may use about $(( have / 1024 )) GB of this Mac's $(mem_gb) GB. Estimated memory for each context:"
+    for c in $CTX_SIZES; do
+        i=$(( i + 1 ))
+        need=$(mem_need_mib "$c")
+        note=""
+        if [ "$c" = "$current" ]; then note="current"; fi
+        if [ "$c" = "$by_ram" ]; then note="${note:+$note, }default for this Mac"; fi
+        if [ "$need" -gt "$have" ]; then note="${note:+$note, }too big"; fi
+        printf '  %d) %4sK  about %s GB%s\n' "$i" "$(( c / 1024 ))" \
+            "$(awk -v m="$need" 'BEGIN { printf "%.1f", m / 1024 }')" "${note:+   ($note)}"
+    done
+    echo "  a) auto: by RAM, now $(( by_ram / 1024 ))K"
+    printf 'Choose 1-%d or a, or press Enter to keep it: ' "$i" >&2
+    if ! read -r ans; then ans=""; echo >&2; fi
+    case "$ans" in
+        '') echo "Kept a $current-token context"; return 0 ;;
+        a|A|auto) choice=auto ;;
+        *[!0-9]*) die "ctx: $ans is not one of the choices" ;;
+        *)
+            if [ "$ans" -lt 1 ] || [ "$ans" -gt "$i" ]; then die "ctx: $ans is not one of the choices"; fi
+            choice=$(echo $CTX_SIZES | cut -d ' ' -f "$ans") ;;
+    esac
+    cmd_use "$choice"
 }
 
 cmd_status() {
@@ -850,6 +905,7 @@ Usage: ./loop [command]
   models    list the quants, and which is downloaded, selected and running
   use       switch the server, and keep the choice: ./loop use Q4_0, a context (32K or auto), or cpu or metal for
             the routing. Builds and downloads what is missing, and brings the old server back if the new one fails
+  ctx       choose the context size from a list, with the memory each needs; or ./loop ctx 32K
   up        start the server in the background and wait until it is ready
   down      stop the server
   restart   down, then up
@@ -867,7 +923,7 @@ command=${1:-pi}
 [ $# -eq 0 ] || shift
 case "$command" in
     -h|--help|help) usage; exit 0 ;;
-    pi|setup|models|use|up|down|restart|detect|shell|logs|status|doctor|check|bench) ;;
+    pi|setup|models|use|ctx|up|down|restart|detect|shell|logs|status|doctor|check|bench) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -877,6 +933,7 @@ case "$command" in
     setup)   cmd_setup ;;
     models)  cmd_models ;;
     use)     cmd_use "$@" ;;
+    ctx)     cmd_ctx "$@" ;;
     up)      cmd_up ;;
     down)    cmd_down ;;
     restart) cmd_down; cmd_up ;;

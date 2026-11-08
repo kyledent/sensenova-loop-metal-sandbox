@@ -85,6 +85,7 @@ work there.
 | `./loop setup` | Check the tools, build the runtime, and download the selected quant and pi |
 | `./loop models` | List the quants, and which are downloaded and running |
 | `./loop use Q4_0` | Switch the quant, the context, or `cpu` or `metal` for the routing, and keep the choice. Brings the old server back if the new one fails |
+| `./loop ctx` | Choose the context size from a list, with the memory each needs on this Mac |
 | `./loop up` / `down` / `restart` | Start or stop the server |
 | `./loop status` / `logs` | See what is running, and follow the server's log |
 | `./loop detect` | List the servers that the agent can see |
